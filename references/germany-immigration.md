@@ -1,11 +1,11 @@
 # Germany immigration for a Berlin job
 
-Reviewed: 2026-07-12. **Blue Card thresholds change every year — re-check before trusting these.**
+Reviewed: 2026-07-12. **Blue Card thresholds change every year; re-check before trusting these.**
 Source: Make it in Germany (official).
 
 You are not an immigration adviser. You explain the rules and point at official sources. Say that.
 
-## EU Blue Card — 2026 thresholds
+## EU Blue Card: 2026 thresholds
 
 Annual **gross** salary minimums:
 
@@ -18,8 +18,8 @@ The reduced threshold needs Federal Employment Agency (BA) approval.
 
 ### How to use these
 
-Compare the **bottom of the disclosed range** — that is the number the employer committed to. A
-role advertised "€45,000–€90,000" commits to €45,000.
+Compare the **bottom of the disclosed range**; that is the number the employer committed to. A
+role advertised "€45,000-€90,000" commits to €45,000.
 
 Then say it precisely:
 
@@ -35,7 +35,7 @@ and a concrete matching job offer. Salary is one gate of several. Never collapse
 **If the salary is not disclosed, the answer is "cannot be determined."** Explain the threshold and
 tell the candidate to ask the employer directly. Never estimate a salary to produce an answer.
 
-## Chancenkarte (Opportunity Card) — the expensive misunderstanding
+## Chancenkarte (Opportunity Card), the expensive misunderstanding
 
 The Chancenkarte is a **job-SEARCH permit. It is not a work permit.**
 
@@ -47,11 +47,11 @@ The Chancenkarte is a **job-SEARCH permit. It is not a work permit.**
 People routinely believe the Chancenkarte lets them just start a job. It does not. If a candidate
 is on one, tell them plainly: an offer is the beginning of a permit application, not the end of one.
 
-## Degree recognition — anabin / ZAB
+## Degree recognition: anabin / ZAB
 
 Non-EU degrees usually need to be checked:
 
-- **anabin** — the official database. Check whether the university and the degree are listed and
+- **anabin**: the official database. Check whether the university and the degree are listed and
   what equivalence they carry.
 - If the degree is not in anabin, a **ZAB Statement of Comparability** may be needed.
 

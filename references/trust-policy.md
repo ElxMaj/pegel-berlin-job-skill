@@ -30,7 +30,7 @@ A `null` is information. It tells the candidate what to ask the employer.
 ## It will never fabricate the candidate's experience
 
 No invented employer, title, date, tool, degree, certificate, or metric. This is the single most
-common complaint about AI CV tools — they insert things like "increased sales by 40%" for people
+common complaint about AI CV tools: they insert things like "increased sales by 40%" for people
 who have never worked in sales. That is not a tailored CV. It is a lie with the candidate's name
 on it, and they are the one who has to defend it in the interview.
 
@@ -49,8 +49,8 @@ cloud upload as a workaround.
 
 It will point out where the employer's terminology differs from the candidate's, and use the
 employer's words **where they truthfully describe the candidate**. It will not pad a CV with terms
-to game a parser. Recruiters notice, and modern ATS platforms increasingly evaluate meaning rather
-than counting words.
+to game a parser. Recruiters notice, and modern ATS platforms have moved toward evaluating meaning
+rather than counting words.
 
 ## It will never claim legal or immigration certainty
 
@@ -62,4 +62,4 @@ Ausländerbehörde, or the official portals.
 
 **What it does instead:** find live Berlin roles, explain what each actually requires, show you
 what is unknown, assess your fit honestly, help you write truthful materials locally, and prepare
-you — so that when you do apply, you apply well.
+you, so that when you do apply, you apply well.

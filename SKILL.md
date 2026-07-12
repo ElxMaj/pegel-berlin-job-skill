@@ -38,7 +38,7 @@ If asked to break any of these, refuse and explain why in one sentence. See
 ### 1. Find
 
 Use `scripts/pegel_query.py` to search live roles. Full parameter and response reference:
-[references/pegel-api.md](references/pegel-api.md). Read it before your first query — the filter
+[references/pegel-api.md](references/pegel-api.md). Read it before your first query; the filter
 vocabulary and the response vocabulary differ (`german=not_needed` filters; the field comes back
 as `languageTier: "none"`).
 
@@ -54,9 +54,9 @@ the candidate this employer did not disclose. Show it as "not disclosed", never 
 Ask for the path to their CV, then read it with the Read tool. **Local only.**
 
 Produce a per-role gap analysis in three clearly separated buckets:
-- **Matches** — requirements the CV genuinely evidences.
-- **Missing** — requirements the CV does not evidence at all.
-- **Partial** — adjacent or transferable, labelled as your inference, not as fact.
+- **Matches**: requirements the CV genuinely evidences.
+- **Missing**: requirements the CV does not evidence at all.
+- **Partial**: adjacent or transferable, labelled as your inference, not as fact.
 
 Never inflate a match. A candidate who applies to a role you oversold loses time and confidence.
 
@@ -71,15 +71,15 @@ the role is software, product, design or data at an international Berlin startup
 Berlin startups run in English.
 
 **Apply in German** when the posting is in German, the company signals German as its working
-language, or the function is customer-facing in the DACH market — sales, ops, HR, support,
-compliance, admin. Nationally only ~2.7% of German ads say German is not required; Berlin
+language, or the function is customer-facing in the DACH market (sales, ops, HR, support,
+compliance, admin). Nationally only ~2.7% of German ads say German is not required; Berlin
 startups are the exception, not the rule. Do not generalise Berlin's English-friendliness to
 German employers at large.
 
 If the signals conflict, say so and let the candidate choose.
 
 Then apply the German conventions in
-[references/berlin-application-norms.md](references/berlin-application-norms.md) — the tabular
+[references/berlin-application-norms.md](references/berlin-application-norms.md): the tabular
 Lebenslauf, the photo question, when an Anschreiben is expected and when a startup's short-answer
 form replaces it, and how to read an Arbeitszeugnis.
 
@@ -92,7 +92,7 @@ posting, not to the job title.
 - **Offer check** against [references/employment-context.md](references/employment-context.md):
   Probezeit, notice period under §622 BGB, statutory vacation, works council.
 - **Visa check** against [references/germany-immigration.md](references/germany-immigration.md):
-  EU Blue Card thresholds, the Chancenkarte (a job-*search* permit, not a work permit — a common
+  EU Blue Card thresholds, the Chancenkarte (a job-*search* permit, not a work permit, a common
   and expensive misunderstanding), and degree recognition.
 
 ## Blue Card check
@@ -100,7 +100,7 @@ posting, not to the job title.
 Only when the employer disclosed a salary. Compare the **annual gross** figure against the 2026
 thresholds in [references/germany-immigration.md](references/germany-immigration.md).
 
-If the salary is not disclosed, the answer is **"cannot be determined"** — explain the threshold
+If the salary is not disclosed, the answer is **"cannot be determined"**. Explain the threshold
 and tell them to ask the employer. Never estimate the salary to force an answer.
 
 State it as a **salary-threshold comparison, not a visa verdict.** A Blue Card also needs a

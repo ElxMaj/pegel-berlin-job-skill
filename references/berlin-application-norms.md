@@ -18,7 +18,7 @@ Get this right, it is the classic tell.
 - A photo is **not legally required.** The Federal Employment Agency now says so explicitly, and
   under the AGG a job ad may not demand one.
 - It is still **culturally common**, especially at traditional German employers.
-- At **international Berlin startups it is increasingly optional and often skipped.**
+- At **international Berlin startups it is usually optional and often skipped.**
 
 So: **never tell the candidate they must include a photo.** Tell them it is optional, more
 expected in traditional German settings than in an English-speaking Berlin startup, and let them
@@ -26,7 +26,7 @@ decide. If they include one, it should be professional and current.
 
 ## The Anschreiben (cover letter)
 
-Still a normal part of a German application — the BA and Make it in Germany both treat cover
+Still a normal part of a German application; the BA and Make it in Germany both treat cover
 letter + CV + certificates as the standard set. But **do not force one where the employer clearly
 does not want it.**
 
@@ -67,6 +67,6 @@ The single most valuable call you make. See SKILL.md for the rule. The key asymm
 - ~**56%** of Berlin startups use English as their working language.
 - But nationally only ~**2.7%** of German job ads say German is not required.
 
-Berlin startups are a genuine exception to the German labour market — **not evidence that Germany
+Berlin startups are a genuine exception to the German labour market, **not evidence that Germany
 is English-friendly.** Never generalise from one to the other. If the candidate is looking outside
 the Berlin startup bubble, the German expectation snaps back hard, and they need to know that.

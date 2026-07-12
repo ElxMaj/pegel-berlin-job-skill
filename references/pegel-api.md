@@ -17,7 +17,7 @@ Comma-separate multi-value params (`?techTags=react,typescript`). Booleans are t
 | Param | Values | Notes |
 |---|---|---|
 | `german` | `not_needed` · `needed` · `unknown` | **The headline filter.** `not_needed` = no German required. |
-| `visa` | `1` | Company-level sponsorship signal (not per-job — see below). |
+| `visa` | `1` | Company-level sponsorship signal (not per-job; see below). |
 | `salaryDisclosed` | `1` | Only roles where the employer published pay. |
 | `techTags` | e.g. `react,python,go` | OR semantics: react OR python. |
 | `seniority` | e.g. `senior`, `entry`, `student` | |
@@ -86,5 +86,5 @@ entire point of this skill.
 ## Getting the job description
 
 The API deliberately does **not** carry the job-description body. To tailor an application, fetch
-the role's `pegelUrl` with WebFetch and read the posting there — one page, for the one job the
+the role's `pegelUrl` with WebFetch and read the posting there: one page, for the one job the
 candidate actually chose. Do not bulk-fetch descriptions.
