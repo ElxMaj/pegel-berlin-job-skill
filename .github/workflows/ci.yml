@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  factuality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pytest
+
+      # The factuality gate. These encode the rules the skill exists to keep:
+      # never invent a salary, never guess Blue Card eligibility, never collapse
+      # an unknown into a "no". If they fail, the skill is not trustworthy.
+      - name: Factuality evals
+        run: python3 -m pytest evals/ -q
+
+      # SKILL.md must use only real frontmatter fields. Inventing fields (version,
+      # tags, license) silently breaks skill loading.
+      - name: Validate SKILL.md frontmatter
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          src = open('SKILL.md').read()
+          m = re.match(r'^---\n(.*?)\n---\n', src, re.S)
+          if not m:
+              sys.exit('SKILL.md has no frontmatter')
+          fm = m.group(1)
+          REAL = {'name','description','when_to_use','argument-hint','arguments',
+                  'disable-model-invocation','user-invocable','allowed-tools',
+                  'disallowed-tools','model','effort','context','agent','hooks','paths','shell'}
+          keys = [l.split(':')[0] for l in fm.split('\n') if l and not l.startswith((' ', '\t', '#'))]
+          bad = [k for k in keys if k not in REAL]
+          if bad:
+              sys.exit(f'Invalid frontmatter fields: {bad}')
+          d = re.search(r'^description: (.*)$', fm, re.M).group(1)
+          w = re.search(r'^when_to_use: (.*)$', fm, re.M)
+          total = len(d) + (len(w.group(1)) if w else 0)
+          if total > 1536:
+              sys.exit(f'description + when_to_use = {total} chars, cap is 1536')
+          print(f'frontmatter OK: {keys}, {total}/1536 chars')
+          PY
+
+      # The skill must never contain instructions to auto-apply. This is the
+      # product's core promise; a regression here is a breach of it.
+      - name: No auto-apply instructions
+        run: |
+          if grep -rniE "auto-?(apply|submit)|mass-?apply" SKILL.md references/ \
+             | grep -viE "never|not |refuse|do not|will never|ban" ; then
+            echo "Found auto-apply language without a refusal context"; exit 1
+          fi
+          echo "no auto-apply instructions ✓"
