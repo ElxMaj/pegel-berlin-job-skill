@@ -1,6 +1,6 @@
 # Pegel Berlin jobs, a Claude Skill
 
-![Pegel Berlin jobs banner](assets/banner.svg)
+![A mechanical arm pulls one card from a wall of identical pinned job cards and hands it to a person, who takes it with their own hand. Pen-and-ink engraving on cream paper.](assets/hero.webp)
 
 Find a Berlin startup job and prepare a **truthful** application for it.
 
