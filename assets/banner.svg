@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="260" viewBox="0 0 880 260" role="img" aria-label="Pegel Berlin jobs, a Claude skill. Find, fit, tailor, prepare. You apply.">
+  <!-- Pegel window-chrome banner: cream chassis, bevel edges, pinstripe title bar. -->
+  <rect width="880" height="260" fill="#EDE5D5"/>
+
+  <!-- hard drop shadow -->
+  <rect x="44" y="44" width="800" height="180" fill="#1C1917" opacity="0.20"/>
+
+  <!-- window body with asymmetric bevel -->
+  <rect x="40" y="40" width="800" height="180" fill="#F4EEE2"/>
+  <rect x="40" y="40" width="800" height="2" fill="#FAF6EE"/>
+  <rect x="40" y="40" width="2" height="180" fill="#FAF6EE"/>
+  <rect x="40" y="218" width="800" height="2" fill="#B8AE9E"/>
+  <rect x="838" y="40" width="2" height="180" fill="#B8AE9E"/>
+
+  <!-- pinstripe title bar -->
+  <g clip-path="url(#bar)">
+    <rect x="42" y="42" width="796" height="26" fill="#F4EEE2"/>
+    <g stroke="#B8AE9E" stroke-width="1">
+      <line x1="42" y1="46" x2="838" y2="46"/>
+      <line x1="42" y1="50" x2="838" y2="50"/>
+      <line x1="42" y1="54" x2="838" y2="54"/>
+      <line x1="42" y1="58" x2="838" y2="58"/>
+      <line x1="42" y1="62" x2="838" y2="62"/>
+    </g>
+  </g>
+  <clipPath id="bar"><rect x="42" y="42" width="796" height="26"/></clipPath>
+
+  <!-- title chip on the pinstripes -->
+  <rect x="352" y="42" width="176" height="26" fill="#F4EEE2"/>
+  <text x="440" y="60" text-anchor="middle" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="13" font-weight="bold" letter-spacing="2" fill="#1F1B17">PEGEL·BERLIN</text>
+
+  <!-- box glyph, top-left -->
+  <rect x="52" y="48" width="14" height="14" fill="#F4EEE2" stroke="#B8AE9E" stroke-width="1.5"/>
+
+  <!-- body copy -->
+  <text x="76" y="118" font-family="Georgia, 'Times New Roman', serif" font-size="34" fill="#1F1B17">A Claude skill for Berlin job hunting</text>
+  <text x="76" y="152" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="15" fill="#6A6258">Find &#183; Fit &#183; Tailor &#183; Prepare. Truthful by construction.</text>
+
+  <!-- install line -->
+  <rect x="76" y="172" width="482" height="30" fill="#FAF7F0" stroke="#B8AE9E" stroke-width="1"/>
+  <text x="90" y="192" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" fill="#1F1B17">npx skills add ElxMaj/pegel-berlin-job-skill</text>
+  <text x="576" y="192" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="13" font-weight="bold" fill="#1F5E51">You apply. Always.</text>
+</svg>
