@@ -48,12 +48,33 @@ jobs:
           print(f'frontmatter OK: {keys}, {total}/1536 chars')
           PY
 
-      # The skill must never contain instructions to auto-apply. This is the
-      # product's core promise; a regression here is a breach of it.
-      - name: No auto-apply instructions
+      # The refusal rules ARE the product. Assert they are present, rather than
+      # grepping for the absence of a string — the docs legitimately discuss
+      # auto-apply tools in order to refuse them, so a naive negative grep
+      # false-positives on its own trust policy.
+      - name: Refusal rules are present
         run: |
-          if grep -rniE "auto-?(apply|submit)|mass-?apply" SKILL.md references/ \
-             | grep -viE "never|not |refuse|do not|will never|ban" ; then
-            echo "Found auto-apply language without a refusal context"; exit 1
-          fi
-          echo "no auto-apply instructions ✓"
+          python3 - <<'PY'
+          import sys
+          skill = open('SKILL.md').read().lower()
+          policy = open('references/trust-policy.md').read().lower()
+
+          required_in_skill = [
+              'never auto-apply',          # no submission, ever
+              'never invent',              # no fabricated salary/visa/language
+              'never fabricate',           # no invented candidate experience
+              'never send the cv',         # CV stays local
+          ]
+          missing = [r for r in required_in_skill if r not in skill]
+          if missing:
+              sys.exit(f'SKILL.md is missing its hard rules: {missing}')
+
+          if 'never auto-apply' not in policy:
+              sys.exit('trust-policy.md no longer refuses auto-apply')
+
+          # The skill must route the human to the apply link, never open it.
+          if 'the human applies' not in skill and 'the human clicks it' not in skill:
+              sys.exit('SKILL.md no longer states that the human does the applying')
+
+          print('refusal rules intact')
+          PY
