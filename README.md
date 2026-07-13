@@ -1,13 +1,11 @@
 # Pegel Berlin jobs, a Claude Skill
 
-![Pegel Berlin jobs banner](assets/banner.svg)
+![Pegel Berlin jobs, a Claude skill for truthful Berlin job hunting. A mechanical assistant selects one card from a wall and hands it to a person.](assets/readme-hero.webp)
 
 Find a Berlin startup job and prepare a **truthful** application for it.
 
 Free. Open source. It will never apply on your behalf, never invent a fact about a job, never
 fabricate your experience, and never send your CV anywhere.
-
-![A mechanical arm pulls one card from a wall of identical pinned job cards and hands it to a person, who takes it with their own hand. Pen-and-ink engraving on cream paper.](assets/hero.webp)
 
 ## What it does
 
