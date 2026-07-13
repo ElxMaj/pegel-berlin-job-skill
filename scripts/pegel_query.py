@@ -45,6 +45,10 @@ def fetch(params: dict[str, str]) -> dict:
         sys.exit(f"Pegel API error {e.code}: {e.reason}")
     except urllib.error.URLError as e:
         sys.exit(f"Could not reach Pegel: {e.reason}")
+    except json.JSONDecodeError:
+        # A 200 with a non-JSON body (proxy error page, captive portal) should
+        # fail as cleanly as a network error, not as a traceback.
+        sys.exit("Pegel returned a response that is not valid JSON. Retry in a minute.")
 
 
 def salary_text(j: dict) -> str:
@@ -121,7 +125,10 @@ def main() -> None:
     total = payload.get("pagination", {}).get("totalCount", len(jobs))
     print(f"{len(jobs)} of {total} matching roles\n")
     for j in jobs:
-        print(f"{j['title']} — {j['company']['name']}")
+        # Defensive .get() throughout: one malformed record must not abort the
+        # whole listing with a KeyError.
+        company = (j.get("company") or {}).get("name") or "unknown company"
+        print(f"{j.get('title') or 'Untitled role'} — {company}")
         print(f"  Location   : {j.get('location') or 'unknown'}")
         print(f"  German     : {LANGUAGE.get(j.get('languageTier'), 'unknown')}")
         print(f"  Visa       : {VISA.get(j.get('visaTier'), 'unknown')}")
@@ -130,7 +137,13 @@ def main() -> None:
         tags = j.get("techTags") or []
         print(f"  Stack      : {', '.join(tags) if tags else 'no stack signal'}")
         print(f"  Last seen  : {j.get('lastSeenAt', 'unknown')}")
-        print(f"  Read/apply : {j['pegelUrl']}")
+        # Only surface a link that is actually Pegel's. A tampered or malformed
+        # response must not plant an arbitrary URL under a trusted label.
+        url = j.get("pegelUrl") or ""
+        if url.startswith("https://pegel.berlin/"):
+            print(f"  Read/apply : {url}")
+        else:
+            print("  Read/apply : unknown (no Pegel link in this record)")
         print()
 
 
