@@ -61,8 +61,9 @@ of unseen roles. Use `--include-decided` only when the candidate asks to review 
 
 ### Job Log
 
-Every result includes its full job ID. Record only a candidate-explicit fact, using the status that
-matches what they said:
+Every result includes its full job ID. Reuse the full job ID already shown when one unambiguous
+current role can be identified. Ask which role only when no single role can be identified. Record
+only a candidate-explicit fact, using the status that matches what they said:
 
 | Candidate explicitly says | Status |
 |---|---|

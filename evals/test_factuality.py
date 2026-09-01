@@ -136,3 +136,8 @@ def test_skill_forbids_raw_correspondence_and_mailbox_identifiers():
 
 def test_skill_keeps_status_and_event_metadata_off_pegel():
     assert "status and metadata never leave the machine" in SKILL_TEXT_LOWER
+
+
+def test_skill_reuses_the_known_job_id_unless_the_role_is_ambiguous():
+    assert "reuse the full job id already shown" in SKILL_TEXT_LOWER
+    assert "ask which role only when no single role can be identified" in SKILL_TEXT_LOWER
