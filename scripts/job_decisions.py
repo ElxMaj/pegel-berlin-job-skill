@@ -130,9 +130,7 @@ def _validate_event(event: object, job_id: str) -> dict:
     if event.get("responseKind") is not None and event["responseKind"] not in RESPONSE_KINDS:
         raise DecisionStoreError(f"Decision file has an invalid responseKind for {job_id}")
 
-    reason = _validate_optional_text(event.get("rejectionReason"), "rejectionReason", 1000)
-    if event["status"] == "rejected" and reason is None:
-        raise DecisionStoreError(f"Decision file has an invalid rejectionReason for {job_id}")
+    _validate_optional_text(event.get("rejectionReason"), "rejectionReason", 1000)
     if event["status"] != "rejected" and "rejectionReason" in event:
         raise DecisionStoreError(f"Decision file has an invalid rejectionReason for {job_id}")
     return copy.deepcopy(event)

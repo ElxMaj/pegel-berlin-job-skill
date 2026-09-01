@@ -119,6 +119,19 @@ def test_record_decision_omits_absent_event_metadata_and_retains_valid_snapshot(
     }
 
 
+def test_record_decision_allows_a_rejected_event_without_a_reason(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+
+    record(decisions, state_file, status="rejected")
+
+    assert decisions.get_decision(state_file, JOB_ID)["history"] == [{
+        "status": "rejected",
+        "date": "2026-09-01",
+        "recordedAt": "2026-09-01T08:30:00Z",
+    }]
+
+
 def test_current_status_ignores_an_older_backfilled_event_appended_last(tmp_path):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
@@ -235,7 +248,6 @@ def test_load_decisions_rejects_malformed_v2_state_without_rewriting_it(tmp_path
         ({"event_date": "2026-02-30"}, "invalid date"),
         ({"now": "2026-09-01T08:30:00+00:00"}, "recordedAt"),
         ({"now": "2026-09-01T08:30:00Z", "rejection_reason": "No", "status": "applied"}, "rejectionReason"),
-        ({"status": "rejected"}, "rejectionReason"),
         ({"status": "rejected", "rejection_reason": "x" * 1001}, "rejectionReason"),
         ({"note": "x" * 4001}, "note"),
         ({"contact_name": "x" * 201}, "contactName"),
