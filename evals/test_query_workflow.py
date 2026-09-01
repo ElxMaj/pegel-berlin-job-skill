@@ -1,0 +1,516 @@
+import json
+import sys
+from io import StringIO
+from pathlib import Path
+
+import pytest
+
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import pegel_query  # noqa: E402
+from job_decisions import record_decision  # noqa: E402
+
+
+IDS = [
+    "f623bce6-6cf2-432e-a3d0-5e9f70ebdc3c",
+    "904334d9-9e13-416b-a76d-10acd8790b3e",
+    "e0b06dbd-2d33-465e-858c-c54d724c4309",
+    "994c5517-70c0-4bbd-b142-f66f21f3f28d",
+]
+
+
+def api_job(job_id, title):
+    return {
+        "id": job_id,
+        "slug": f"{title.lower().replace(' ', '-')}-{job_id[:8]}",
+        "title": title,
+        "company": {"slug": "example", "name": "Example GmbH"},
+        "location": "Berlin",
+        "seniorityRaw": "senior",
+        "contractTypeRaw": "full_time",
+        "languageTier": "none",
+        "visaTier": None,
+        "remoteModeTier": "hybrid",
+        "salaryMin": None,
+        "salaryMax": None,
+        "salaryCurrency": None,
+        "salaryPeriod": None,
+        "techTags": ["python"],
+        "summaryText": None,
+        "postedAt": "2026-08-31T12:00:00Z",
+        "firstSeenAt": "2026-08-31T13:00:00Z",
+        "lastSeenAt": "2026-09-01T04:00:00Z",
+        "status": "active",
+        "expiredAt": None,
+        "atsUrl": "https://jobs.example.test/role",
+        "pegelUrl": f"https://pegel.berlin/jobs/{title.lower().replace(' ', '-')}-{job_id[:8]}",
+    }
+
+
+def test_collect_jobs_filters_decisions_and_keeps_paging_until_the_limit():
+    pages = {
+        1: [api_job(IDS[0], "Passed role"), api_job(IDS[1], "Fresh one")],
+        2: [api_job(IDS[2], "Applied role"), api_job(IDS[3], "Fresh two")],
+    }
+    calls = []
+
+    def fetch_page(params):
+        calls.append(dict(params))
+        page = int(params["page"])
+        return {
+            "data": pages[page],
+            "pagination": {"page": page, "pageSize": 100, "totalCount": 4, "totalPages": 2},
+        }
+
+    result = pegel_query.collect_jobs(
+        {"q": "engineer"},
+        limit=2,
+        decided_ids={IDS[0], IDS[2]},
+        fetch_page=fetch_page,
+    )
+
+    assert [job["id"] for job in result.jobs] == [IDS[1], IDS[3]]
+    assert result.api_total_count == 4
+    assert result.scanned == 4
+    assert result.decided_excluded == 2
+    assert result.pages_fetched == 2
+    assert calls == [
+        {"q": "engineer", "page": "1", "pageSize": "100"},
+        {"q": "engineer", "page": "2", "pageSize": "100"},
+    ]
+
+
+def test_collect_jobs_can_include_decided_roles_for_an_explicit_review():
+    calls = []
+
+    def fetch_page(params):
+        calls.append(dict(params))
+        return {
+            "data": [api_job(IDS[0], "Passed role"), api_job(IDS[1], "Fresh role")],
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 2, "totalPages": 1},
+        }
+
+    result = pegel_query.collect_jobs(
+        {},
+        limit=2,
+        decided_ids={IDS[0]},
+        include_decided=True,
+        fetch_page=fetch_page,
+    )
+
+    assert [job["id"] for job in result.jobs] == [IDS[0], IDS[1]]
+    assert result.decided_excluded == 0
+    assert calls == [{"page": "1", "pageSize": "100"}]
+
+
+def test_mark_command_saves_the_verdict_locally_without_sending_it_to_the_api(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    api_reads = []
+    stdout = StringIO()
+
+    def fetch_detail(job_id):
+        api_reads.append(job_id)
+        return api_job(job_id, "Founder Associate")
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark", IDS[0], "shortlisted"],
+        fetch_detail=fetch_detail,
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert api_reads == [IDS[0]]
+    assert "shortlisted" in stdout.getvalue()
+    assert '"verdict": "shortlisted"' in state_file.read_text()
+
+
+def test_mark_command_uses_a_normal_read_to_keep_a_local_job_snapshot(tmp_path, monkeypatch):
+    state_file = tmp_path / "job-decisions.json"
+    api_reads = []
+
+    def fetch_job(job_id):
+        api_reads.append(job_id)
+        return api_job(job_id, "Saved role")
+
+    monkeypatch.setattr(pegel_query, "fetch_job", fetch_job, raising=False)
+    pegel_query.main(
+        ["--state-file", str(state_file), "--mark", IDS[0], "shortlisted"],
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=StringIO(),
+    )
+
+    saved = state_file.read_text()
+    assert api_reads == [IDS[0]]
+    assert '"title": "Saved role"' in saved
+    assert '"pegelUrl": "https://pegel.berlin/jobs/saved-role-f623bce6"' in saved
+
+
+def test_list_decisions_reads_a_shortlist_offline(tmp_path, monkeypatch):
+    state_file = tmp_path / "job-decisions.json"
+    job = api_job(IDS[0], "Saved role")
+    record_decision(
+        state_file,
+        IDS[0],
+        "shortlisted",
+        job=job,
+        now="2026-09-01T08:30:00Z",
+    )
+    stdout = StringIO()
+
+    def unexpected_api_call(*_args, **_kwargs):
+        raise AssertionError("listing local decisions must not call Pegel")
+
+    monkeypatch.setattr(pegel_query, "fetch", unexpected_api_call)
+    monkeypatch.setattr(pegel_query, "fetch_job", unexpected_api_call)
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--list-decisions", "shortlisted"],
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "1 shortlisted role" in output
+    assert "Saved role" in output
+    assert "Example GmbH" in output
+    assert IDS[0] in output
+    assert job["pegelUrl"] in output
+
+
+def test_forget_command_makes_a_role_unjudged_again(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    record_decision(
+        state_file,
+        IDS[0],
+        "passed",
+        job=api_job(IDS[0], "Passed role"),
+        now="2026-09-01T08:30:00Z",
+    )
+    stdout = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--forget", IDS[0]],
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert "will appear in normal searches again" in stdout.getvalue()
+    assert '"jobs": {}' in state_file.read_text()
+
+
+def test_search_command_filters_decisions_in_json_and_pages_for_unseen_roles(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    for job_id, verdict in ((IDS[0], "passed"), (IDS[2], "applied")):
+        record_decision(
+            state_file,
+            job_id,
+            verdict,
+            job=None,
+            now="2026-09-01T08:30:00Z",
+        )
+    pages = {
+        1: [api_job(IDS[0], "Passed role"), api_job(IDS[1], "Fresh one")],
+        2: [api_job(IDS[2], "Applied role"), api_job(IDS[3], "Fresh two")],
+    }
+
+    def fetch_page(params):
+        page = int(params["page"])
+        return {
+            "data": pages[page],
+            "pagination": {"page": page, "pageSize": 100, "totalCount": 4, "totalPages": 2},
+        }
+
+    stdout = StringIO()
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--q", "engineer", "--limit", "2", "--json"],
+        fetch_page=fetch_page,
+        stdout=stdout,
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert [job["id"] for job in payload["data"]] == [IDS[1], IDS[3]]
+    assert payload["pagination"] == {
+        "page": 1,
+        "pageSize": 2,
+        "totalCount": 4,
+        "totalPages": 2,
+    }
+    assert payload["selection"] == {
+        "returned": 2,
+        "apiMatches": 4,
+        "scanned": 4,
+        "decidedExcluded": 2,
+        "decidedFiltering": True,
+    }
+
+
+def test_mark_command_keeps_the_local_decision_when_snapshot_read_fails(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    stdout = StringIO()
+    stderr = StringIO()
+
+    def offline(_job_id):
+        raise pegel_query.PegelApiError("Could not reach Pegel")
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark", IDS[0], "passed"],
+        fetch_detail=offline,
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert "Marked" in stdout.getvalue()
+    assert "saved without a job snapshot" in stderr.getvalue()
+    saved = json.loads(state_file.read_text())["jobs"][IDS[0]]
+    assert saved["verdict"] == "passed"
+    assert saved["title"] is None
+
+
+@pytest.mark.parametrize("read_result", [b"\xff", OSError("response body read failed")])
+def test_mark_command_keeps_the_decision_when_the_http_body_cannot_be_read(
+    tmp_path,
+    monkeypatch,
+    read_result,
+):
+    state_file = tmp_path / "job-decisions.json"
+    stderr = StringIO()
+
+    class UnreadableResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            if isinstance(read_result, Exception):
+                raise read_result
+            return read_result
+
+    monkeypatch.setattr(
+        pegel_query.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: UnreadableResponse(),
+    )
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark", IDS[0], "shortlisted"],
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert "saved without a job snapshot" in stderr.getvalue()
+    assert json.loads(state_file.read_text())["jobs"][IDS[0]]["verdict"] == "shortlisted"
+
+
+def test_invalid_verdict_is_rejected_before_any_api_read(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    api_reads = []
+    stderr = StringIO()
+
+    def fetch_detail(job_id):
+        api_reads.append(job_id)
+        return api_job(job_id, "Role")
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark", IDS[0], "rejected"],
+        fetch_detail=fetch_detail,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert api_reads == []
+    assert "shortlisted, applied, passed" in stderr.getvalue()
+    assert not state_file.exists()
+
+
+def test_short_job_suffix_is_rejected_before_any_api_read(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    api_reads = []
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark", "f623bce6", "shortlisted"],
+        fetch_detail=lambda job_id: api_reads.append(job_id),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert api_reads == []
+    assert "full Pegel job UUID" in stderr.getvalue()
+    assert not state_file.exists()
+
+
+def test_collect_jobs_rejects_a_malformed_api_page_instead_of_treating_it_as_empty():
+    def malformed_page(_params):
+        return {
+            "data": "not-a-job-array",
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 1, "totalPages": 1},
+        }
+
+    with pytest.raises(pegel_query.PegelApiError, match="invalid job-list response"):
+        pegel_query.collect_jobs(
+            {},
+            limit=1,
+            decided_ids=set(),
+            fetch_page=malformed_page,
+        )
+
+
+def test_list_command_reports_corrupt_local_state_without_a_traceback(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    state_file.write_text("not json")
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--list-decisions", "all"],
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert "not valid JSON" in stderr.getvalue()
+
+
+def test_collect_jobs_deduplicates_a_role_that_moves_between_live_pages():
+    pages = {
+        1: [api_job(IDS[0], "Fresh one")],
+        2: [api_job(IDS[0], "Fresh one")],
+        3: [api_job(IDS[1], "Fresh two")],
+    }
+
+    def fetch_page(params):
+        page = int(params["page"])
+        return {
+            "data": pages[page],
+            "pagination": {"page": page, "pageSize": 100, "totalCount": 2, "totalPages": 3},
+        }
+
+    result = pegel_query.collect_jobs(
+        {},
+        limit=2,
+        decided_ids=set(),
+        fetch_page=fetch_page,
+    )
+
+    assert [job["id"] for job in result.jobs] == [IDS[0], IDS[1]]
+    assert result.pages_fetched == 3
+
+
+def test_decision_commands_are_mutually_exclusive(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+
+    with pytest.raises(SystemExit) as raised:
+        pegel_query.main(
+            [
+                "--state-file",
+                str(state_file),
+                "--mark",
+                IDS[0],
+                "shortlisted",
+                "--forget",
+                IDS[0],
+            ],
+            fetch_detail=lambda job_id: api_job(job_id, "Role"),
+            stdout=StringIO(),
+        )
+
+    assert raised.value.code == 2
+    assert not state_file.exists()
+
+
+def test_collect_jobs_rejects_a_role_without_a_full_job_uuid():
+    malformed_job = api_job(IDS[0], "Role")
+    malformed_job["id"] = "f623bce6"
+
+    def fetch_page(_params):
+        return {
+            "data": [malformed_job],
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 1, "totalPages": 1},
+        }
+
+    with pytest.raises(pegel_query.PegelApiError, match="invalid job ID"):
+        pegel_query.collect_jobs(
+            {},
+            limit=1,
+            decided_ids=set(),
+            fetch_page=fetch_page,
+        )
+
+
+def test_text_search_prints_the_full_id_needed_for_a_later_decision(tmp_path):
+    def fetch_page(_params):
+        return {
+            "data": [api_job(IDS[0], "Fresh role")],
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 1, "totalPages": 1},
+        }
+
+    stdout = StringIO()
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / "decisions.json"), "--limit", "1"],
+        fetch_page=fetch_page,
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert f"Job ID     : {IDS[0]}" in stdout.getvalue()
+
+
+def test_text_search_never_prints_a_control_character_url_under_the_pegel_label(tmp_path):
+    hostile_job = api_job(IDS[0], "Fresh role")
+    hostile_job["pegelUrl"] = "https://pegel.berlin/jobs/role\x1b]52;c;tampered\x07"
+
+    def fetch_page(_params):
+        return {
+            "data": [hostile_job],
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 1, "totalPages": 1},
+        }
+
+    stdout = StringIO()
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / "decisions.json"), "--limit", "1"],
+        fetch_page=fetch_page,
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert "\x1b" not in stdout.getvalue()
+    assert "Read/apply : unknown (no Pegel link in this record)" in stdout.getvalue()
+
+
+def test_include_decided_flag_is_wired_through_the_search_command(tmp_path):
+    state_file = tmp_path / "decisions.json"
+    record_decision(
+        state_file,
+        IDS[0],
+        "passed",
+        job=None,
+        now="2026-09-01T08:30:00Z",
+    )
+
+    def fetch_page(_params):
+        return {
+            "data": [api_job(IDS[0], "Passed role")],
+            "pagination": {"page": 1, "pageSize": 100, "totalCount": 1, "totalPages": 1},
+        }
+
+    stdout = StringIO()
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--include-decided", "--limit", "1", "--json"],
+        fetch_page=fetch_page,
+        stdout=stdout,
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert [job["id"] for job in payload["data"]] == [IDS[0]]
+    assert payload["selection"]["decidedFiltering"] is False

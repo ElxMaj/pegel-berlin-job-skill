@@ -22,6 +22,10 @@ fabricate your experience, and never send your CV anywhere.
 4. **Prepare** covers interview prep, and an offer check against German employment law: Probezeit,
    notice period (§622 BGB), vacation, EU Blue Card thresholds.
 
+Searches also remember your decisions across sessions. Roles marked `shortlisted`, `applied` or
+`passed` are hidden from normal results, so each search surfaces roles you have not judged yet.
+Here, `passed` means you chose not to pursue the role. Shortlists remain available locally.
+
 ## Why it is different
 
 Generic AI CV tools are built for the US market and get Germany wrong. This one knows:
@@ -80,7 +84,41 @@ Or just ask: *"Find me Berlin backend jobs that don't need German and sponsor vi
 ```bash
 python3 scripts/pegel_query.py --german not_needed --salary-disclosed --limit 10
 python3 scripts/pegel_query.py --tech-tags react,typescript --seniority senior
+python3 scripts/pegel_query.py --mark <full-job-id> shortlisted
+python3 scripts/pegel_query.py --list-decisions shortlisted
+python3 scripts/pegel_query.py --forget <full-job-id>
 ```
+
+Normal searches exclude every role with a saved verdict and keep paging until they return the
+requested number of unseen roles. Pass `--include-decided` only when you want those roles included
+again without deleting their decisions.
+
+## Local decisions
+
+The skill stores decisions in `~/.local/share/pegel/job-decisions.json` by default, or under
+`$XDG_DATA_HOME/pegel/` when that variable is set. You can choose another file with
+`PEGEL_DECISIONS_FILE` or the script's `--state-file` option.
+
+```json
+{
+  "version": 1,
+  "jobs": {
+    "f623bce6-6cf2-432e-a3d0-5e9f70ebdc3c": {
+      "verdict": "shortlisted",
+      "updatedAt": "2026-09-01T08:30:00Z",
+      "title": "Founder’s Associate",
+      "company": "NetBird",
+      "pegelUrl": "https://pegel.berlin/jobs/founder-s-associate-f623bce6"
+    }
+  }
+}
+```
+
+The directory is created with `0700` permissions and the file with `0600` permissions on systems
+that support POSIX modes. Writes are atomic. Invalid or newer schemas fail loudly instead of being
+overwritten. Listing saved decisions is offline. Marking one may read the public job endpoint once
+to save its title and link, but the verdict is never included in an API request and never leaves
+your machine.
 
 ## Data
 

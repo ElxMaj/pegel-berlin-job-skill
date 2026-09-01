@@ -9,6 +9,8 @@ Usage:
   python3 scripts/pegel_query.py --german not_needed --salary-disclosed --limit 10
   python3 scripts/pegel_query.py --tech-tags react,typescript --seniority senior
   python3 scripts/pegel_query.py --q "platform engineer" --json
+  python3 scripts/pegel_query.py --mark <full-job-id> shortlisted
+  python3 scripts/pegel_query.py --list-decisions shortlisted
 """
 from __future__ import annotations
 
@@ -18,6 +20,22 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from job_decisions import (
+    DecisionStoreError,
+    VERDICTS,
+    decision_path,
+    forget_decision,
+    is_trusted_pegel_url,
+    list_decisions,
+    load_decisions,
+    normalize_job_id,
+    record_decision,
+)
 
 API = "https://pegel.berlin/api/v1/jobs"
 UA = "pegel-berlin-job-skill (+https://github.com/ElxMaj/pegel-berlin-job-skill)"
@@ -33,22 +51,111 @@ LANGUAGE = {"none": "No German required", "required": "German required", None: "
 VISA = {"sponsors": "Sponsors visas", "does_not_sponsor": "Does not sponsor", None: "unknown"}
 
 
-def fetch(params: dict[str, str]) -> dict:
-    url = f"{API}?{urllib.parse.urlencode(params)}"
+class PegelApiError(RuntimeError):
+    """A read from Pegel's public API failed or returned an invalid shape."""
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    jobs: list[dict]
+    api_total_count: int
+    scanned: int
+    decided_excluded: int
+    pages_fetched: int
+
+
+def _fetch_json(url: str, *, allow_not_found: bool = False) -> dict | None:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code == 404 and allow_not_found:
+            return None
         if e.code == 429:
-            sys.exit("Rate limited by Pegel (60 req/min). Wait a minute and retry.")
-        sys.exit(f"Pegel API error {e.code}: {e.reason}")
+            raise PegelApiError("Rate limited by Pegel (60 req/min). Wait a minute and retry.") from e
+        raise PegelApiError(f"Pegel API error {e.code}: {e.reason}") from e
     except urllib.error.URLError as e:
-        sys.exit(f"Could not reach Pegel: {e.reason}")
+        raise PegelApiError(f"Could not reach Pegel: {e.reason}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        raise PegelApiError("Pegel response could not be read. Retry in a minute.") from e
     except json.JSONDecodeError:
         # A 200 with a non-JSON body (proxy error page, captive portal) should
         # fail as cleanly as a network error, not as a traceback.
-        sys.exit("Pegel returned a response that is not valid JSON. Retry in a minute.")
+        raise PegelApiError("Pegel returned a response that is not valid JSON. Retry in a minute.")
+
+
+def fetch(params: dict[str, str]) -> dict:
+    payload = _fetch_json(f"{API}?{urllib.parse.urlencode(params)}")
+    if not isinstance(payload, dict):
+        raise PegelApiError("Pegel returned an invalid job-list response")
+    return payload
+
+
+def fetch_job(job_id: str) -> dict | None:
+    job_id = normalize_job_id(job_id)
+    url = f"{API}/{urllib.parse.quote(job_id, safe='')}"
+    payload = _fetch_json(url, allow_not_found=True)
+    if payload is None:
+        return None
+    job = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(job, dict) or job.get("id") != job_id:
+        raise PegelApiError("Pegel returned an invalid job response")
+    return job
+
+
+def collect_jobs(
+    params: dict[str, str],
+    *,
+    limit: int,
+    decided_ids: set[str],
+    include_decided: bool = False,
+    fetch_page: Callable[[dict[str, str]], dict] = fetch,
+) -> SearchResult:
+    jobs: list[dict] = []
+    scanned = 0
+    decided_excluded = 0
+    page = 1
+    api_total_count = 0
+    seen_job_ids: set[str] = set()
+
+    while len(jobs) < limit:
+        page_params = {**params, "page": str(page), "pageSize": "100"}
+        payload = fetch_page(page_params)
+        page_jobs = payload.get("data") if isinstance(payload, dict) else None
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        if (
+            not isinstance(page_jobs, list)
+            or not all(isinstance(job, dict) for job in page_jobs)
+            or not isinstance(pagination, dict)
+            or not isinstance(pagination.get("totalCount"), int)
+            or not isinstance(pagination.get("totalPages"), int)
+        ):
+            raise PegelApiError("Pegel returned an invalid job-list response")
+        api_total_count = pagination["totalCount"]
+
+        for job in page_jobs:
+            scanned += 1
+            try:
+                job_id = normalize_job_id(job.get("id"))
+            except DecisionStoreError as error:
+                raise PegelApiError("Pegel returned a job with an invalid job ID") from error
+            if job_id in seen_job_ids:
+                continue
+            seen_job_ids.add(job_id)
+            if not include_decided and job_id in decided_ids:
+                decided_excluded += 1
+                continue
+            jobs.append(job)
+            if len(jobs) == limit:
+                break
+
+        total_pages = pagination["totalPages"]
+        if not page_jobs or page >= total_pages:
+            break
+        page += 1
+
+    return SearchResult(jobs, api_total_count, scanned, decided_excluded, page)
 
 
 def salary_text(j: dict) -> str:
@@ -85,8 +192,42 @@ def blue_card(j: dict) -> str:
     return f"below both 2026 thresholds (< {BLUE_CARD_2026_SHORTAGE:,.2f} EUR)"
 
 
-def main() -> None:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    fetch_page: Callable[[dict[str, str]], dict] | None = None,
+    fetch_detail: Callable[[str], dict | None] | None = None,
+    now: Callable[[], str] = utc_now,
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+) -> int:
     p = argparse.ArgumentParser(description="Search live Berlin startup jobs on Pegel.")
+    p.add_argument(
+        "--state-file",
+        type=Path,
+        help="override the local decision file (also PEGEL_DECISIONS_FILE)",
+    )
+    decision_actions = p.add_mutually_exclusive_group()
+    decision_actions.add_argument(
+        "--mark",
+        nargs=2,
+        metavar=("JOB_ID", "VERDICT"),
+        help="save shortlisted, applied or passed for a full job UUID",
+    )
+    decision_actions.add_argument(
+        "--list-decisions",
+        choices=("all", *VERDICTS),
+        help="list saved decisions locally without an API request",
+    )
+    decision_actions.add_argument(
+        "--forget",
+        metavar="JOB_ID",
+        help="delete one decision so the role appears in normal searches again",
+    )
     p.add_argument("--german", choices=["not_needed", "needed", "unknown"])
     p.add_argument("--visa", action="store_true", help="Company-level sponsorship signal")
     p.add_argument("--salary-disclosed", action="store_true")
@@ -98,10 +239,70 @@ def main() -> None:
     p.add_argument("--posted-within", choices=["7d", "30d", "90d", "all"])
     p.add_argument("--q")
     p.add_argument("--limit", type=int, default=10, help="max 100")
-    p.add_argument("--json", action="store_true", help="raw JSON")
-    a = p.parse_args()
+    p.add_argument(
+        "--include-decided",
+        action="store_true",
+        help="include roles already marked shortlisted, applied or passed",
+    )
+    p.add_argument("--json", action="store_true", help="locally filtered JSON")
+    a = p.parse_args(argv)
 
-    params: dict[str, str] = {"pageSize": str(min(max(a.limit, 1), 100))}
+    state_file = decision_path(a.state_file)
+    if a.mark:
+        job_id, verdict = a.mark
+        if verdict not in VERDICTS:
+            print(f"Decision error: Verdict must be one of: {', '.join(VERDICTS)}", file=stderr)
+            return 2
+        try:
+            job_id = normalize_job_id(job_id)
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 2
+        try:
+            job = (fetch_detail or fetch_job)(job_id)
+        except PegelApiError as error:
+            job = None
+            print(f"Warning: {error}; saved without a job snapshot.", file=stderr)
+        try:
+            record_decision(state_file, job_id, verdict, job=job, now=now())
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 2
+        print(f"Marked {job_id} as {verdict}. Saved locally in {state_file}", file=stdout)
+        return 0
+    if a.list_decisions:
+        verdict = None if a.list_decisions == "all" else a.list_decisions
+        try:
+            saved = list_decisions(state_file, verdict)
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 1
+        label = a.list_decisions
+        noun = "role" if len(saved) == 1 else "roles"
+        print(f"{len(saved)} {label} {noun}\n", file=stdout)
+        for item in saved:
+            print(f"{item.get('title') or 'Unknown role'} — {item.get('company') or 'unknown company'}", file=stdout)
+            print(f"  Verdict : {item['verdict']}", file=stdout)
+            print(f"  Updated : {item.get('updatedAt') or 'unknown'}", file=stdout)
+            print(f"  Job ID  : {item['id']}", file=stdout)
+            if item.get("pegelUrl"):
+                print(f"  Read     : {item['pegelUrl']}", file=stdout)
+            print(file=stdout)
+        return 0
+    if a.forget:
+        try:
+            removed = forget_decision(state_file, a.forget)
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 1
+        if removed:
+            print(f"Forgot {a.forget}. It will appear in normal searches again.", file=stdout)
+        else:
+            print(f"No local decision exists for {a.forget}.", file=stdout)
+        return 0
+
+    limit = min(max(a.limit, 1), 100)
+    params: dict[str, str] = {}
     if a.german:
         params["german"] = a.german
     if a.visa:
@@ -115,37 +316,75 @@ def main() -> None:
         if val:
             params[key] = val
 
-    payload = fetch(params)
-    jobs = payload.get("data", [])
+    try:
+        decisions = load_decisions(state_file)["jobs"]
+        result = collect_jobs(
+            params,
+            limit=limit,
+            decided_ids=set(decisions),
+            include_decided=a.include_decided,
+            fetch_page=fetch_page or fetch,
+        )
+    except (DecisionStoreError, PegelApiError) as error:
+        print(f"Error: {error}", file=stderr)
+        return 1
+    jobs = result.jobs
 
     if a.json:
-        print(json.dumps(payload, indent=2))
-        return
+        print(
+            json.dumps(
+                {
+                    "data": jobs,
+                    "pagination": {
+                        "page": 1,
+                        "pageSize": limit,
+                        "totalCount": result.api_total_count,
+                        "totalPages": (result.api_total_count + limit - 1) // limit,
+                    },
+                    "selection": {
+                        "returned": len(jobs),
+                        "apiMatches": result.api_total_count,
+                        "scanned": result.scanned,
+                        "decidedExcluded": result.decided_excluded,
+                        "decidedFiltering": not a.include_decided,
+                    },
+                },
+                indent=2,
+            ),
+            file=stdout,
+        )
+        return 0
 
-    total = payload.get("pagination", {}).get("totalCount", len(jobs))
-    print(f"{len(jobs)} of {total} matching roles\n")
+    qualifier = "matching" if a.include_decided else "unseen"
+    print(f"{len(jobs)} {qualifier} of {result.api_total_count} matching roles", file=stdout)
+    if result.decided_excluded:
+        print(f"{result.decided_excluded} decided roles skipped while scanning", file=stdout)
+    print(file=stdout)
     for j in jobs:
         # Defensive .get() throughout: one malformed record must not abort the
         # whole listing with a KeyError.
         company = (j.get("company") or {}).get("name") or "unknown company"
-        print(f"{j.get('title') or 'Untitled role'} — {company}")
-        print(f"  Location   : {j.get('location') or 'unknown'}")
-        print(f"  German     : {LANGUAGE.get(j.get('languageTier'), 'unknown')}")
-        print(f"  Visa       : {VISA.get(j.get('visaTier'), 'unknown')}")
-        print(f"  Salary     : {salary_text(j)}")
-        print(f"  Blue Card  : {blue_card(j)}")
+        print(f"{j.get('title') or 'Untitled role'} — {company}", file=stdout)
+        print(f"  Job ID     : {j.get('id') or 'unknown'}", file=stdout)
+        print(f"  Location   : {j.get('location') or 'unknown'}", file=stdout)
+        print(f"  German     : {LANGUAGE.get(j.get('languageTier'), 'unknown')}", file=stdout)
+        print(f"  Visa       : {VISA.get(j.get('visaTier'), 'unknown')}", file=stdout)
+        print(f"  Salary     : {salary_text(j)}", file=stdout)
+        print(f"  Blue Card  : {blue_card(j)}", file=stdout)
         tags = j.get("techTags") or []
-        print(f"  Stack      : {', '.join(tags) if tags else 'no stack signal'}")
-        print(f"  Last seen  : {j.get('lastSeenAt', 'unknown')}")
+        print(f"  Stack      : {', '.join(tags) if tags else 'no stack signal'}", file=stdout)
+        print(f"  Last seen  : {j.get('lastSeenAt', 'unknown')}", file=stdout)
         # Only surface a link that is actually Pegel's. A tampered or malformed
         # response must not plant an arbitrary URL under a trusted label.
         url = j.get("pegelUrl") or ""
-        if url.startswith("https://pegel.berlin/"):
-            print(f"  Read/apply : {url}")
+        if is_trusted_pegel_url(url):
+            print(f"  Read/apply : {url}", file=stdout)
         else:
-            print("  Read/apply : unknown (no Pegel link in this record)")
-        print()
+            print("  Read/apply : unknown (no Pegel link in this record)", file=stdout)
+        print(file=stdout)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
