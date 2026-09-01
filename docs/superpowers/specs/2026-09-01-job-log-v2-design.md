@@ -1,7 +1,7 @@
 # Pegel Job Log v2 Design
 
-**Date:** 2026-09-01  
-**Repository:** `ElxMaj/pegel-berlin-job-skill`  
+**Date:** 2026-09-01
+**Repository:** `ElxMaj/pegel-berlin-job-skill`
 **Scope:** The first PR in the approved local-first roadmap
 
 ## Goal
