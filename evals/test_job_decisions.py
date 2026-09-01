@@ -73,7 +73,9 @@ def symlink_or_mocked_lstat(monkeypatch, target, link, *, force_mocked_fallback)
         yield True
         return
 
-    link.write_bytes(b"mocked symlink")
+    link.write_bytes(target.read_bytes())
+    if os.name != "nt":
+        link.chmod(0o600)
     real_lstat = Path.lstat
     link_stat = real_lstat(link)
     stat_values = list(link_stat)
@@ -107,6 +109,8 @@ def hard_link_or_mocked_fstat(
 
     if inspected_path == link:
         link.write_bytes(source.read_bytes())
+        if os.name != "nt":
+            link.chmod(0o600)
     elif inspected_path != source:
         raise AssertionError("mocked hard-link inspection path must be one link endpoint")
 
@@ -403,9 +407,10 @@ def test_v1_mutation_rejects_a_backup_symlink_to_the_source_without_changes(
         backup_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision backup is not a regular file: {backup_file}"
     assert state_file.read_bytes() == original
     assert backup_file.is_symlink() is native_link
 
@@ -429,9 +434,10 @@ def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(
         backup_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision backup is not independent: {backup_file}"
     assert state_file.read_bytes() == original
     assert os.path.samefile(state_file, backup_file) is native_link
 
@@ -457,9 +463,10 @@ def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(
         backup_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision backup is not independent: {backup_file}"
     assert state_file.read_bytes() == original
     assert backup_file.read_bytes() == original
     assert backup_alias.exists() is native_link
@@ -557,9 +564,10 @@ def test_mutation_rejects_a_lock_symlink_to_the_source_without_changes(
         lock_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision lock is not a regular file: {lock_file}"
     assert state_file.read_bytes() == original
     assert lock_file.is_symlink() is native_link
 
@@ -581,9 +589,10 @@ def test_mutation_rejects_a_lock_hard_link_to_the_source_without_changes(
         lock_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision lock is not independent: {lock_file}"
     assert state_file.read_bytes() == original
     assert os.path.samefile(state_file, lock_file) is native_link
 
@@ -607,9 +616,10 @@ def test_mutation_rejects_a_lock_hard_link_to_another_file_without_writing_it(
         lock_file,
         force_mocked_fallback=force_mocked_fallback,
     ) as native_link:
-        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        with pytest.raises(decisions.DecisionStoreError) as raised:
             record(decisions, state_file)
 
+    assert str(raised.value) == f"Decision lock is not independent: {lock_file}"
     assert state_file.read_bytes() == original
     assert other_file.read_bytes() == b""
     assert os.path.samefile(other_file, lock_file) is native_link
