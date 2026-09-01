@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -195,6 +196,7 @@ def test_v1_reads_normalize_in_memory_without_writing_or_creating_a_backup(tmp_p
     state_file.write_bytes(original_v1_bytes)
 
     normalized = decisions.load_decisions(state_file)
+    fetched = decisions.get_decision(state_file, JOB_ID)
     listed = decisions.list_decisions(state_file, "shortlisted")
 
     assert normalized["version"] == 2
@@ -205,8 +207,137 @@ def test_v1_reads_normalize_in_memory_without_writing_or_creating_a_backup(tmp_p
         "recordedAt": "2026-09-01T08:30:00Z",
     }]
     assert listed[0]["id"] == JOB_ID
+    assert fetched["id"] == JOB_ID
     assert state_file.read_bytes() == original_v1_bytes
     assert not Path(f"{state_file}.v1.bak").exists()
+
+
+def test_first_v1_mutation_preserves_exact_backup_and_migrates_history(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({
+        "version": 1,
+        "jobs": {JOB_ID: {
+            "verdict": "shortlisted",
+            "updatedAt": "2026-08-31T08:00:00Z",
+            "title": "Founder’s Associate",
+        }},
+    }, indent=1, ensure_ascii=False).encode("utf-8")
+    state_file.write_bytes(original)
+
+    record(decisions, state_file, status="applied")
+
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert backup_file.read_bytes() == original
+    assert saved["version"] == 2
+    assert [event["status"] for event in saved["jobs"][JOB_ID]["history"]] == [
+        "shortlisted",
+        "applied",
+    ]
+    if os.name != "nt":
+        assert stat.S_IMODE(backup_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+
+
+def test_v1_mutation_accepts_an_identical_existing_backup(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    backup_file.write_bytes(original)
+
+    record(decisions, state_file)
+
+    assert backup_file.read_bytes() == original
+    assert decisions.get_decision(state_file, JOB_ID)["status"] == "shortlisted"
+
+
+def test_v1_mutation_rejects_a_different_existing_backup_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    conflicting_backup = b"different backup\n"
+    state_file.write_bytes(original)
+    backup_file.write_bytes(conflicting_backup)
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert backup_file.read_bytes() == conflicting_backup
+
+
+def test_mutation_reports_lock_contention_without_changing_source(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    record(decisions, state_file)
+    original = state_file.read_bytes()
+
+    with decisions._store_lock(state_file):
+        with pytest.raises(
+            decisions.DecisionStoreError,
+            match="^Decision file is busy; retry the command$",
+        ):
+            record(decisions, state_file, status="applied")
+        with pytest.raises(
+            decisions.DecisionStoreError,
+            match="^Decision file is busy; retry the command$",
+        ):
+            decisions.forget_decision(state_file, SECOND_JOB_ID)
+
+    assert state_file.read_bytes() == original
+
+
+def test_backup_creation_failure_keeps_v1_source_intact(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+
+    real_open = decisions.os.open
+
+    def fail_backup(path, *args, **kwargs):
+        if Path(path) == Path(f"{state_file}.v1.bak"):
+            raise OSError("disk unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(decisions.os, "open", fail_backup)
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "boundary", ["serialization", "temporary write", "chmod", "replace"]
+)
+def test_atomic_write_failures_keep_source_intact(tmp_path, monkeypatch, boundary):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    record(decisions, state_file)
+    original = state_file.read_bytes()
+
+    def fail(*_args, **_kwargs):
+        if boundary == "serialization":
+            raise TypeError("not serializable")
+        raise OSError(f"failed {boundary}")
+
+    if boundary == "serialization":
+        monkeypatch.setattr(decisions.json, "dumps", fail)
+    elif boundary == "temporary write":
+        monkeypatch.setattr(decisions.tempfile, "mkstemp", fail)
+    elif boundary == "chmod":
+        monkeypatch.setattr(decisions.os, "chmod", fail)
+    else:
+        monkeypatch.setattr(decisions.os, "replace", fail)
+
+    with pytest.raises(decisions.DecisionStoreError, match="write"):
+        record(decisions, state_file, status="applied")
+
+    assert state_file.read_bytes() == original
 
 
 @pytest.mark.parametrize(
@@ -295,8 +426,9 @@ def test_record_decision_persists_event_metadata_and_private_file_permissions(tm
         "responseKind": "human",
         "contactName": "Camille Martin",
     }
-    assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(state_file.parent.stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(state_file.parent.stat().st_mode) == 0o700
 
 
 def test_list_decisions_filters_by_status_and_orders_latest_writes_first(tmp_path):
@@ -342,10 +474,12 @@ def test_custom_state_file_does_not_change_permissions_on_an_existing_parent(tmp
     decisions = decisions_module()
     shared_parent = tmp_path / "shared"
     shared_parent.mkdir(mode=0o755)
-    shared_parent.chmod(0o755)
+    if os.name != "nt":
+        shared_parent.chmod(0o755)
     state_file = shared_parent / "job-decisions.json"
 
     record(decisions, state_file)
 
-    assert stat.S_IMODE(shared_parent.stat().st_mode) == 0o755
-    assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(shared_parent.stat().st_mode) == 0o755
+        assert stat.S_IMODE(state_file.stat().st_mode) == 0o600

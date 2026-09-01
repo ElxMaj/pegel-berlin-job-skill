@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import unicodedata
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -217,35 +218,142 @@ def _validate_v2(store: object) -> dict:
 
 
 def load_decisions(path: Path) -> dict:
-    if not path.exists():
-        return _empty_store()
+    return _read_store(path)[0]
+
+
+def _read_store(path: Path) -> tuple[dict, int | None, bytes]:
+    path = Path(path)
     try:
-        store = json.loads(path.read_text(encoding="utf-8"))
+        source_bytes = path.read_bytes()
+    except FileNotFoundError:
+        return _empty_store(), None, b""
+    except OSError as error:
+        raise DecisionStoreError(f"Could not read decision file: {path}") from error
+    try:
+        store = json.loads(source_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DecisionStoreError(f"Decision file is not valid JSON: {path}") from error
     if not isinstance(store, dict) or type(store.get("version")) is not int:
         raise DecisionStoreError("Decision file has an unsupported schema version")
     if store["version"] == 1:
-        return _validate_v2(_normalize_v1(store))
-    return _validate_v2(store)
+        return _validate_v2(_normalize_v1(store)), 1, source_bytes
+    return _validate_v2(store), store["version"], source_bytes
 
 
-def _write_store(path: Path, store: dict) -> None:
-    parent_created = not path.parent.exists()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if parent_created:
-        os.chmod(path.parent, 0o700)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary_path = Path(temporary_name)
+@contextmanager
+def _store_lock(path: Path):
+    path = Path(path)
+    lock_path = Path(f"{path}.lock")
     try:
+        parent_created = not path.parent.exists()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent_created:
+            os.chmod(path.parent, 0o700)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as error:
+        raise DecisionStoreError(f"Could not open decision lock: {lock_path}") from error
+
+    acquired = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, PermissionError) as error:
+            raise DecisionStoreError("Decision file is busy; retry the command") from error
+        except OSError as error:
+            raise DecisionStoreError(f"Could not lock decision file: {lock_path}") from error
+        yield
+    finally:
+        try:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except OSError as error:
+            raise DecisionStoreError(f"Could not release decision lock: {lock_path}") from error
+
+
+def _ensure_v1_backup(path: Path, source_bytes: bytes) -> None:
+    backup_path = Path(f"{path}.v1.bak")
+    created = False
+    fd = None
+    try:
+        try:
+            fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            if backup_path.read_bytes() != source_bytes:
+                raise DecisionStoreError(
+                    f"Decision backup does not match source: {backup_path}"
+                )
+            return
+        with os.fdopen(fd, "wb") as handle:
+            fd = None
+            handle.write(source_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except DecisionStoreError:
+        raise
+    except (OSError, UnicodeError) as error:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise DecisionStoreError(f"Could not create decision backup: {backup_path}") from error
+
+
+def _atomic_write(path: Path, store: dict) -> None:
+    path = Path(path)
+    fd = None
+    temporary_path = None
+    try:
+        serialized = json.dumps(store, indent=2, ensure_ascii=False) + "\n"
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary_path = Path(temporary_name)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(store, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+            fd = None
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, path)
+        temporary_path = None
+    except (OSError, UnicodeError, TypeError, ValueError, OverflowError) as error:
+        raise DecisionStoreError(f"Could not write decision file: {path}") from error
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as error:
+                raise DecisionStoreError(f"Could not clean up decision write: {path}") from error
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as error:
+                raise DecisionStoreError(f"Could not clean up decision write: {path}") from error
 
 
 def _event_input(
@@ -327,18 +435,21 @@ def record_decision(
         response_kind,
         contact_name,
     )
-    store = load_decisions(path)
-    existing = store["jobs"].get(job_id, {})
-    snapshot = _snapshot_from_job(job, existing)
-    history = [*existing.get("history", []), event]
-    record = {
-        "status": _current_event(history)["status"],
-        "updatedAt": now,
-        "history": history,
-        **snapshot,
-    }
-    store["jobs"][job_id] = record
-    _write_store(path, store)
+    with _store_lock(path):
+        store, original_version, source_bytes = _read_store(path)
+        existing = store["jobs"].get(job_id, {})
+        snapshot = _snapshot_from_job(job, existing)
+        history = [*existing.get("history", []), event]
+        record = {
+            "status": _current_event(history)["status"],
+            "updatedAt": now,
+            "history": history,
+            **snapshot,
+        }
+        store["jobs"][job_id] = record
+        if original_version == 1:
+            _ensure_v1_backup(path, source_bytes)
+        _atomic_write(path, store)
     return {"id": job_id, **copy.deepcopy(record)}
 
 
@@ -363,9 +474,12 @@ def list_decisions(path: Path, status: str | None = None) -> list[dict]:
 
 def forget_decision(path: Path, job_id: str) -> bool:
     job_id = normalize_job_id(job_id)
-    store = load_decisions(path)
-    if job_id not in store["jobs"]:
-        return False
-    del store["jobs"][job_id]
-    _write_store(path, store)
-    return True
+    with _store_lock(path):
+        store, original_version, source_bytes = _read_store(path)
+        if job_id not in store["jobs"]:
+            return False
+        del store["jobs"][job_id]
+        if original_version == 1:
+            _ensure_v1_backup(path, source_bytes)
+        _atomic_write(path, store)
+        return True
