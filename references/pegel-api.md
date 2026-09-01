@@ -45,13 +45,16 @@ encountered while filling this result, not every judged role across all pages. D
 as the candidate's total decision count. Use `--list-decisions all` for that.
 
 The application-history file is local. The list endpoint never receives its contents.
-`--list-decisions` and `--history` make no API request. `--mark` may read the single public
-`GET /jobs/<uuid>` endpoint to save a display snapshot, but sends only the public job UUID. If the
-read fails, it saves the event without the snapshot.
+`--list-decisions` and `--history` make no API request. `--mark-json-stdin`, and the legacy
+`--mark` compatibility action, may read the single public `GET /jobs/<uuid>` endpoint to save a
+display snapshot, but sends only the public job UUID. If the read fails, it saves the event without
+the snapshot.
 
-The `--date`, `--note`, `--reason`, `--response-kind`, and `--contact-name` flags are local CLI
-inputs. They are not Pegel API parameters and are never copied into a URL, request body, or header.
-Neither status nor event metadata leaves the candidate's machine. See
+The preferred private action reads one bounded JSON object from stdin, keeping status and metadata
+out of child argv. The legacy `--date`, `--note`, `--reason`, `--response-kind`, and
+`--contact-name` direct CLI inputs may be visible in process arguments or shell history. Neither
+form copies status or metadata into a Pegel URL, request body, or header. Stdin transport does not
+prevent host transcript or output capture. See
 `python3 scripts/pegel_query.py --help` for commands and [the trust policy](trust-policy.md) for the
 privacy rules.
 

@@ -1,5 +1,6 @@
 import json
 import sys
+from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -10,6 +11,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import pegel_query  # noqa: E402
+import job_decisions  # noqa: E402
 from job_decisions import record_decision  # noqa: E402
 
 
@@ -637,6 +639,172 @@ def test_mark_json_has_one_data_envelope_and_keeps_metadata_out_of_the_request(t
     assert requested == [IDS[0]]
     assert len(now_calls) == 1
     assert json.loads(stdout.getvalue()) == {"data": complete_record}
+
+
+def test_mark_json_stdin_keeps_the_complete_private_mark_out_of_child_argv(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    requested = []
+    stdout = StringIO()
+    payload = {
+        "jobId": IDS[0].upper(),
+        "status": "rejected",
+        "date": "2026-08-31",
+        "note": "Follow up next quarter",
+        "rejectionReason": "Position filled",
+        "responseKind": "human",
+        "contactName": "Alex Martin",
+    }
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin", "--json"],
+        stdin=StringIO(json.dumps(payload)),
+        fetch_detail=lambda job_id: requested.append(job_id) or api_job(job_id, "Saved role"),
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=stdout,
+    )
+
+    saved = json.loads(stdout.getvalue())["data"]
+    assert exit_code == 0
+    assert requested == [IDS[0]]
+    assert saved["history"] == [{
+        "status": "rejected",
+        "date": "2026-08-31",
+        "recordedAt": "2026-09-01T08:30:00Z",
+        "note": "Follow up next quarter",
+        "rejectionReason": "Position filled",
+        "responseKind": "human",
+        "contactName": "Alex Martin",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("raw_payload", "message"),
+    [
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "extra": True}), "unknown"),
+        (json.dumps({"status": "shortlisted"}), "jobId"),
+        (json.dumps({"jobId": IDS[0]}), "status"),
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "note": None}), "null"),
+        (json.dumps([{"jobId": IDS[0], "status": "shortlisted"}]), "object"),
+        ("{} {}", "JSON"),
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "note": "x" * 4001}), "note"),
+        ("x" * 20_000, "large"),
+    ],
+)
+def test_invalid_mark_json_stdin_is_rejected_before_network_or_write(
+    tmp_path, raw_payload, message
+):
+    state_file = tmp_path / "job-decisions.json"
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin"],
+        stdin=StringIO(raw_payload),
+        fetch_detail=lambda _job_id: pytest.fail("invalid stdin must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert message.lower() in stderr.getvalue().lower()
+    assert state_file.read_bytes() == original
+
+
+def test_mark_json_stdin_rejects_legacy_metadata_flags_before_network_or_write(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin", "--note", "argv value"],
+        stdin=StringIO(json.dumps({"jobId": IDS[0], "status": "shortlisted"})),
+        fetch_detail=lambda _job_id: pytest.fail("conflicting input must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert "conflict" in stderr.getvalue().lower()
+    assert not state_file.exists()
+
+
+def test_mark_json_stdin_does_not_echo_an_unknown_control_character_key(tmp_path):
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / "decisions.json"), "--mark-json-stdin"],
+        stdin=StringIO(json.dumps({
+            "jobId": IDS[0],
+            "status": "shortlisted",
+            "unknown\x1b[31m": "value",
+        })),
+        fetch_detail=lambda _job_id: pytest.fail("invalid stdin must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert stderr.getvalue() == "Decision error: Mark JSON has unknown fields\n"
+
+
+def test_committed_mark_cleanup_failure_returns_success_without_inviting_a_blind_retry(
+    tmp_path, monkeypatch
+):
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    lock_fds = []
+    real_open = job_decisions.os.open
+    real_close = job_decisions.os.close
+    stdout = StringIO()
+    stderr = StringIO()
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == lock_file:
+            lock_fds.append(fd)
+        return fd
+
+    def fail_lock_close(fd):
+        if fd in lock_fds:
+            raise OSError("close failed")
+        return real_close(fd)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(job_decisions.os, "open", track_open)
+            patch.setattr(job_decisions.os, "close", fail_lock_close)
+            exit_code = pegel_query.main(
+                ["--state-file", str(state_file), "--mark-json-stdin"],
+                stdin=StringIO(json.dumps({"jobId": IDS[0], "status": "shortlisted"})),
+                fetch_detail=lambda _job_id: None,
+                now=lambda: "2026-09-01T08:30:00Z",
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        assert exit_code == 0
+        assert "change was saved" in stderr.getvalue().lower()
+        assert "inspect" in stderr.getvalue().lower()
+        assert "before" in stderr.getvalue().lower()
+        assert "decision error" not in stderr.getvalue().lower()
+        assert len(json.loads(state_file.read_text())["jobs"][IDS[0]]["history"]) == 1
+    finally:
+        for fd in lock_fds:
+            real_close(fd)
+
+
+def test_help_describes_private_mark_transport_and_all_saved_status_filtering():
+    output = StringIO()
+
+    with redirect_stdout(output), pytest.raises(SystemExit) as raised:
+        pegel_query.main(["--help"])
+
+    help_text = output.getvalue().lower()
+    assert raised.value.code == 0
+    assert "--mark-json-stdin" in help_text
+    assert "child argv" in help_text
+    assert "direct cli compatibility" in help_text
+    assert "any saved status" in help_text
 
 
 def test_list_history_and_forget_json_envelopes_are_stable_and_offline(tmp_path, monkeypatch):

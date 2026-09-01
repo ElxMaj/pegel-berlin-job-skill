@@ -67,6 +67,9 @@ never inferred from Pegel, the job description, silence, or correspondence. A re
 contact name may also be stored locally when explicitly supplied or approved. Raw message bodies,
 email addresses, attachments, and mailbox identifiers are never stored.
 
+`--forget` removes a role only from the active log. An existing `.v1.bak` migration backup remains
+sensitive recovery data and is never automatically rewritten or deleted.
+
 ## It will never keyword-stuff
 
 It will point out where the employer's terminology differs from the candidate's, and use the

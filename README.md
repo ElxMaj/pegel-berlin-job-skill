@@ -86,8 +86,7 @@ Or just ask: *"Find me Berlin backend jobs that don't need German and sponsor vi
 ```bash
 python3 scripts/pegel_query.py --german not_needed --salary-disclosed --limit 10
 python3 scripts/pegel_query.py --tech-tags react,typescript --seniority senior
-python3 scripts/pegel_query.py --mark <full-job-id> shortlisted
-python3 scripts/pegel_query.py --mark <full-job-id> rejected --date 2026-08-31 --reason "Role was filled"
+python3 scripts/pegel_query.py --mark-json-stdin
 python3 scripts/pegel_query.py --list-decisions shortlisted
 python3 scripts/pegel_query.py --history <full-job-id>
 python3 scripts/pegel_query.py --forget <full-job-id>
@@ -142,20 +141,46 @@ is when the event was saved. `note`, `rejectionReason`, `responseKind`, and `con
 ### Commands
 
 - Search: use the documented filters, plus `--include-decided` to include roles already in the log.
-- Mark: `--mark <full-job-id> <status>` appends an event. Optional mark-only metadata is
+- Private mark: `--mark-json-stdin` reads one JSON object with required `jobId` and `status` fields
+  and optional `date`, `note`, `rejectionReason`, `responseKind`, and `contactName` fields. It is
+  bounded to 16 KiB and keeps those values out of child argv.
+- Legacy mark: `--mark <full-job-id> <status>` remains a direct CLI compatibility input. Optional
+  mark-only metadata is
   `--date YYYY-MM-DD`, `--note <short-summary>`, `--reason <short-rejection-reason>`,
   `--response-kind human|automated|unknown`, and `--contact-name <name>`. `--reason` is valid only
-  with `rejected`.
+  with `rejected`. Legacy values may be visible in process arguments and shell history.
 - List: `--list-decisions all` or `--list-decisions <status>` reads the local file only.
 - History: `--history <full-job-id>` reads one chronological local timeline only.
-- Forget: `--forget <full-job-id>` removes that role and its complete history.
+- Forget: `--forget <full-job-id>` removes that role and its complete history from the active log.
+  It does not erase an existing schema v1 migration backup.
 - Output and location: add `--json` for JSON, and use `--state-file <path>` or
   `PEGEL_DECISIONS_FILE` to override the default file. Run `python3 scripts/pegel_query.py --help`
   for the full search-filter reference.
 
+The stdin payload is exactly one object. Omit optional fields instead of sending `null`:
+
+```json
+{
+  "jobId": "f623bce6-6cf2-432e-a3d0-5e9f70ebdc3c",
+  "status": "rejected",
+  "date": "2026-08-31",
+  "note": "Follow up next quarter",
+  "rejectionReason": "Role was filled",
+  "responseKind": "human",
+  "contactName": "Alex Martin"
+}
+```
+
+A candidate can run `python3 scripts/pegel_query.py --mark-json-stdin`, paste the approved object,
+then send end-of-input. An agent may execute it only when its host supplies a separate structural
+stdin channel.
+
 Only candidate-explicit facts belong in the log. A note or rejection reason is a short summary the
 candidate supplied or approved. Never copy raw message bodies, email addresses, attachments, or
 mailbox identifiers into it. Silence is not a rejection, and ambiguous outcomes need confirmation.
+Stdin transport avoids putting private mark values in child argv. It does not prevent the host from
+capturing its transcript or output, so use only a host-provided structural stdin channel for agent
+execution.
 
 ### Local JSON success envelopes
 
@@ -182,8 +207,8 @@ commands use these envelopes, where `record` is the v2 job object shown above:
 }
 ```
 
-`--mark` returns `{"data": record}` and `--history` returns the same envelope with the events in
-chronological order.
+`--mark-json-stdin` and legacy `--mark` return `{"data": record}`. `--history` returns the same
+envelope with the events in chronological order.
 
 ```json
 {"data": [], "selection": {"status": "all", "returned": 0}}
@@ -202,8 +227,13 @@ requested status.
 
 Reading a schema v1 file normalizes it in memory but does not rewrite it. On the first mutation,
 the script creates `<decision-file>.v1.bak` with the exact original v1 bytes before writing v2. If
-an identical backup already exists, it is reused. If its bytes differ, the mutation fails and
-leaves both files alone. Invalid or newer schemas fail without being overwritten.
+an identical backup already exists, it is reused only when it is an independent private regular
+file. Symlinks, non-regular entries, the same underlying file or a hard link, and group- or
+other-accessible POSIX files are rejected without changing either file. Invalid or newer schemas
+fail without being overwritten.
+
+The `.v1.bak` file remains sensitive recovery data. It is never automatically rewritten or deleted,
+including by `--forget`, which removes data only from the active log.
 
 Mutations take an exclusive local lock; a concurrent mutation fails loudly with a retry message.
 Writes use a same-directory temporary file, flush it, then atomically replace the decision file.

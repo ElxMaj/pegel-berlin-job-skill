@@ -81,10 +81,11 @@ job UUID:
 }
 ```
 
-Each explicit `--mark` appends one event. Repeating a status is allowed because a candidate can have
-multiple interview steps or add a later factual update. `date` is the event's calendar date and
-defaults to the current UTC date. `--date YYYY-MM-DD` supports truthful backfill. `recordedAt` is the
-automatic UTC timestamp at which the command wrote the event.
+Each explicit mark, through preferred `--mark-json-stdin` or legacy `--mark`, appends one event.
+Repeating a status is allowed because a candidate can have multiple interview steps or add a later
+factual update. `date` is the preferred stdin field for the event's calendar date and defaults to
+the current UTC date. Legacy `--date YYYY-MM-DD` also supports truthful backfill. `recordedAt` is
+the automatic UTC timestamp at which the command wrote the event.
 
 The current `status` is derived from the event with the latest `date`; ties resolve by `recordedAt`
 and then append order. Backfilling an older event therefore preserves the genuinely current status.
@@ -97,10 +98,14 @@ Optional event metadata is omitted when absent:
 - `responseKind`, one of `human`, `automated`, or `unknown`;
 - `contactName`, maximum 200 characters.
 
-Names, reasons, and notes are accepted only from explicit command arguments. The skill never derives
-them from a job description or a guessed application outcome. Validation rejects NUL, terminal
-escape characters, invalid dates, invalid enums, and oversized text. Newlines and tabs are allowed
-in notes and reasons, then rendered with safe indentation in text output.
+Names, reasons, and notes are accepted only from an explicit candidate-approved mark. The preferred
+agent path is one bounded, closed-schema JSON object through `--mark-json-stdin`, using a structural
+stdin channel so private values do not enter child argv. Legacy `--mark` flags remain process-visible
+direct CLI compatibility inputs. Stdin transport does not prevent host transcript or output capture.
+The skill never derives metadata from a job description or a guessed application outcome.
+Validation rejects missing required fields, explicit nulls, unknown fields, NUL, terminal escape
+characters, invalid dates, invalid enums, and oversized text. Newlines and tabs are allowed in notes
+and reasons, then rendered with safe indentation in text output.
 
 ## Migration and durability
 
@@ -112,15 +117,24 @@ The first mutation of a v1 file performs these steps under the store lock:
 
 1. Read and validate the exact v1 bytes.
 2. Create an adjacent `job-decisions.json.v1.bak` with private permissions using exclusive creation.
-3. If that backup already exists, continue only when its bytes match the current v1 file.
+3. If that backup already exists, continue only when it is an independent private regular file and
+   its bytes match the current v1 file. Reject symlinks, non-regular entries, the same underlying
+   file or a hard link, and group- or other-accessible POSIX files.
 4. Write schema v2 to a temporary private file and atomically replace the original.
 
-Any backup, lock, serialization, permission, or replace failure becomes a concise
+Any backup, lock, serialization, permission, or replace failure before commit becomes a concise
 `DecisionStoreError`. The original file remains untouched when migration cannot complete.
+The sensitive `.v1.bak` recovery file is never automatically rewritten or deleted. `--forget`
+removes a role only from the active log and does not erase an existing migration backup.
 
 Writes use one cross-platform advisory lock file beside the store. Unix uses `fcntl`; Windows uses
 `msvcrt`. A second writer fails cleanly rather than silently losing an event. The lock file contains
 no personal data and remains available for reuse after release.
+An unlock error followed by a successful descriptor close does not turn a committed mutation into
+failure. A descriptor-close failure after commit raises the distinct
+`DecisionStoreCommittedError` for library callers. The CLI returns success with a warning that the
+change was saved and local history must be inspected before another update. Cleanup never masks a
+primary body error.
 
 ## Command contract
 
@@ -132,17 +146,18 @@ python3 scripts/pegel_query.py --list-decisions shortlisted
 python3 scripts/pegel_query.py --forget <job-id>
 ```
 
-New history commands and event metadata use the same script:
+The preferred private mark action and new history command use the same script:
 
 ```bash
-python3 scripts/pegel_query.py --mark <job-id> applied --date 2026-08-24 --note "Applied on the employer site"
-python3 scripts/pegel_query.py --mark <job-id> rejected --reason "Role was filled" --response-kind human --contact-name "Example Recruiter"
+python3 scripts/pegel_query.py --mark-json-stdin
 python3 scripts/pegel_query.py --history <job-id>
 ```
 
-`--reason`, `--response-kind`, `--contact-name`, `--note`, and `--date` are valid only with
-`--mark`. `--reason` additionally requires `rejected`. Invalid combinations fail before any API
-request or local write.
+The stdin object requires `jobId` and `status`; `date`, `note`, `rejectionReason`, `responseKind`,
+and `contactName` are optional but cannot be null when present. Unknown fields are rejected.
+Legacy `--reason`, `--response-kind`, `--contact-name`, `--note`, and `--date` flags are valid only
+with `--mark`; `--reason` additionally requires `rejected`. Invalid combinations fail before any
+API request or local write.
 
 `--json` becomes a supported contract for every local action:
 
@@ -179,7 +194,8 @@ Implementation follows test-first cycles. The required gates are:
 1. Every new behavior is observed failing before production code is written.
 2. Existing 56 tests remain green throughout.
 3. Migration preserves every v1 value and the exact original bytes in the backup.
-4. No metadata argument reaches a mocked Pegel API request.
+4. No metadata from stdin or a legacy process argument reaches a mocked Pegel API request; only the
+   normalized public UUID may reach the detail reader.
 5. A backfilled older event does not replace a newer current status.
 6. Corrupt, newer, control-character-bearing, oversized, or concurrently written state fails loud.
 7. Text and JSON workflows pass on Linux, macOS, and Windows CI.

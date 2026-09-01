@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import stat
 import tempfile
 import unicodedata
 from contextlib import contextmanager
@@ -44,6 +45,24 @@ _RECORD_FIELDS = {"status", "updatedAt", "history", "title", "company", "pegelUr
 
 class DecisionStoreError(ValueError):
     """The local decision file or requested update is invalid."""
+
+
+class DecisionStoreCommittedError(DecisionStoreError):
+    """The requested mutation committed, but descriptor cleanup failed."""
+
+    def __init__(self, message: str, committed_result: object):
+        super().__init__(message)
+        self.committed_result = copy.deepcopy(committed_result)
+
+
+class _StoreLockState:
+    def __init__(self) -> None:
+        self.committed = False
+        self.committed_result = None
+
+    def mark_committed(self, result: object) -> None:
+        self.committed = True
+        self.committed_result = copy.deepcopy(result)
 
 
 def decision_path(override: Path | None = None) -> Path:
@@ -126,12 +145,19 @@ def _validate_event(event: object, job_id: str) -> dict:
         raise DecisionStoreError(f"Decision file has an invalid status for {job_id}")
     _parse_event_date(event.get("date"))
     _parse_utc_timestamp(event.get("recordedAt"), "recordedAt")
-    _validate_optional_text(event.get("note"), "note", 4000)
-    _validate_optional_text(event.get("contactName"), "contactName", 200)
-    if event.get("responseKind") is not None and event["responseKind"] not in RESPONSE_KINDS:
-        raise DecisionStoreError(f"Decision file has an invalid responseKind for {job_id}")
+    for field, limit in (("note", 4000), ("contactName", 200)):
+        if field in event:
+            if event[field] is None:
+                raise DecisionStoreError(f"Decision file has an invalid {field} for {job_id}")
+            _validate_optional_text(event[field], field, limit)
+    if "responseKind" in event:
+        if event["responseKind"] is None or event["responseKind"] not in RESPONSE_KINDS:
+            raise DecisionStoreError(f"Decision file has an invalid responseKind for {job_id}")
 
-    _validate_optional_text(event.get("rejectionReason"), "rejectionReason", 1000)
+    if "rejectionReason" in event:
+        if event["rejectionReason"] is None:
+            raise DecisionStoreError(f"Decision file has an invalid rejectionReason for {job_id}")
+        _validate_optional_text(event["rejectionReason"], "rejectionReason", 1000)
     if event["status"] != "rejected" and "rejectionReason" in event:
         raise DecisionStoreError(f"Decision file has an invalid rejectionReason for {job_id}")
     return copy.deepcopy(event)
@@ -251,6 +277,8 @@ def _store_lock(path: Path):
         raise DecisionStoreError(f"Could not open decision lock: {lock_path}") from error
 
     acquired = False
+    state = _StoreLockState()
+    primary_error = None
     try:
         try:
             if os.name == "nt":
@@ -269,9 +297,12 @@ def _store_lock(path: Path):
             raise DecisionStoreError("Decision file is busy; retry the command") from error
         except OSError as error:
             raise DecisionStoreError(f"Could not lock decision file: {lock_path}") from error
-        yield
+        yield state
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        cleanup_error = None
+        close_error = None
         try:
             if acquired:
                 if os.name == "nt":
@@ -283,18 +314,61 @@ def _store_lock(path: Path):
                     import fcntl
 
                     fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
         except OSError as error:
-            cleanup_error = error
-        finally:
+            close_error = error
+        if close_error is not None and primary_error is None:
+            message = f"Could not release decision lock: {lock_path}"
+            if state.committed:
+                raise DecisionStoreCommittedError(
+                    message,
+                    state.committed_result,
+                ) from close_error
+            raise DecisionStoreError(
+                message
+            ) from close_error
+
+
+def _read_existing_v1_backup(path: Path, backup_path: Path) -> bytes:
+    fd = None
+    try:
+        backup_lstat = backup_path.lstat()
+        if not stat.S_ISREG(backup_lstat.st_mode):
+            raise DecisionStoreError(f"Decision backup is not a regular file: {backup_path}")
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(backup_path, flags)
+        backup_fstat = os.fstat(fd)
+        if not stat.S_ISREG(backup_fstat.st_mode) or not os.path.samestat(
+            backup_lstat, backup_fstat
+        ):
+            raise DecisionStoreError(f"Decision backup changed while opening: {backup_path}")
+        if backup_fstat.st_nlink != 1:
+            raise DecisionStoreError(f"Decision backup is not independent: {backup_path}")
+        if os.path.samestat(path.stat(), backup_fstat):
+            raise DecisionStoreError(f"Decision backup is not independent: {backup_path}")
+        if os.name != "nt" and backup_fstat.st_mode & 0o077:
+            raise DecisionStoreError(f"Decision backup is not private: {backup_path}")
+
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            return handle.read()
+    except DecisionStoreError:
+        raise
+    except OSError as error:
+        raise DecisionStoreError(f"Could not verify decision backup: {backup_path}") from error
+    finally:
+        if fd is not None:
             try:
                 os.close(fd)
             except OSError as error:
-                if cleanup_error is None:
-                    cleanup_error = error
-        if cleanup_error is not None:
-            raise DecisionStoreError(
-                f"Could not release decision lock: {lock_path}"
-            ) from cleanup_error
+                raise DecisionStoreError(
+                    f"Could not verify decision backup: {backup_path}"
+                ) from error
 
 
 def _ensure_v1_backup(path: Path, source_bytes: bytes) -> None:
@@ -303,10 +377,11 @@ def _ensure_v1_backup(path: Path, source_bytes: bytes) -> None:
     fd = None
     try:
         try:
-            fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            fd = os.open(backup_path, flags, 0o600)
             created = True
         except FileExistsError:
-            if backup_path.read_bytes() != source_bytes:
+            if _read_existing_v1_backup(path, backup_path) != source_bytes:
                 raise DecisionStoreError(
                     f"Decision backup does not match source: {backup_path}"
                 )
@@ -454,7 +529,8 @@ def record_decision(
         response_kind,
         contact_name,
     )
-    with _store_lock(path):
+    result = None
+    with _store_lock(path) as lock:
         store, original_version, source_bytes = _read_store(path)
         existing = store["jobs"].get(job_id, {})
         snapshot = _snapshot_from_job(job, existing)
@@ -469,7 +545,9 @@ def record_decision(
         if original_version == 1:
             _ensure_v1_backup(path, source_bytes)
         _atomic_write(path, store)
-    return {"id": job_id, **copy.deepcopy(record)}
+        result = {"id": job_id, **copy.deepcopy(record)}
+        lock.mark_committed(result)
+    return result
 
 
 def get_decision(path: Path, job_id: str) -> dict | None:
@@ -508,7 +586,7 @@ def list_decisions(path: Path, status: str | None = None) -> list[dict]:
 
 def forget_decision(path: Path, job_id: str) -> bool:
     job_id = normalize_job_id(job_id)
-    with _store_lock(path):
+    with _store_lock(path) as lock:
         store, original_version, source_bytes = _read_store(path)
         if job_id not in store["jobs"]:
             return False
@@ -516,4 +594,5 @@ def forget_decision(path: Path, job_id: str) -> bool:
         if original_version == 1:
             _ensure_v1_backup(path, source_bytes)
         _atomic_write(path, store)
+        lock.mark_committed(True)
         return True

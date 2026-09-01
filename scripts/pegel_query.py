@@ -9,7 +9,7 @@ Usage:
   python3 scripts/pegel_query.py --german not_needed --salary-disclosed --limit 10
   python3 scripts/pegel_query.py --tech-tags react,typescript --seniority senior
   python3 scripts/pegel_query.py --q "platform engineer" --json
-  python3 scripts/pegel_query.py --mark <full-job-id> shortlisted
+  python3 scripts/pegel_query.py --mark-json-stdin
   python3 scripts/pegel_query.py --list-decisions shortlisted
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable
 
 from job_decisions import (
+    DecisionStoreCommittedError,
     DecisionStoreError,
     STATUSES,
     chronological_history,
@@ -52,10 +53,55 @@ BLUE_CARD_2026_SHORTAGE = 45_934.20
 # languageTier (response) -> plain English. null is a real answer: "we don't know".
 LANGUAGE = {"none": "No German required", "required": "German required", None: "unknown"}
 VISA = {"sponsors": "Sponsors visas", "does_not_sponsor": "Does not sponsor", None: "unknown"}
+MARK_STDIN_MAX_BYTES = 16 * 1024
+MARK_STDIN_FIELDS = {
+    "jobId",
+    "status",
+    "date",
+    "note",
+    "rejectionReason",
+    "responseKind",
+    "contactName",
+}
 
 
 class PegelApiError(RuntimeError):
     """A read from Pegel's public API failed or returned an invalid shape."""
+
+
+def _read_mark_json_stdin(stdin) -> dict:
+    try:
+        raw_payload = stdin.read(MARK_STDIN_MAX_BYTES + 1)
+    except (OSError, UnicodeError) as error:
+        raise DecisionStoreError("Could not read mark JSON from stdin") from error
+    if not isinstance(raw_payload, str):
+        raise DecisionStoreError("Mark JSON stdin must be text")
+    try:
+        payload_size = len(raw_payload.encode("utf-8"))
+    except UnicodeError as error:
+        raise DecisionStoreError("Mark JSON stdin is not valid UTF-8 text") from error
+    if payload_size > MARK_STDIN_MAX_BYTES:
+        raise DecisionStoreError("Mark JSON stdin is too large")
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise DecisionStoreError("Mark stdin must contain one valid JSON object") from error
+    if not isinstance(payload, dict):
+        raise DecisionStoreError("Mark stdin must contain one JSON object")
+    unknown = set(payload) - MARK_STDIN_FIELDS
+    if unknown:
+        raise DecisionStoreError("Mark JSON has unknown fields")
+    missing = {"jobId", "status"} - set(payload)
+    if missing:
+        raise DecisionStoreError(
+            f"Mark JSON is missing required field: {', '.join(sorted(missing))}"
+        )
+    null_fields = [field for field, value in payload.items() if value is None]
+    if null_fields:
+        raise DecisionStoreError(
+            f"Mark JSON fields may not be null: {', '.join(sorted(null_fields))}"
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -253,6 +299,7 @@ def main(
     fetch_page: Callable[[dict[str, str]], dict] | None = None,
     fetch_detail: Callable[[str], dict | None] | None = None,
     now: Callable[[], str] = utc_now,
+    stdin=sys.stdin,
     stdout=sys.stdout,
     stderr=sys.stderr,
 ) -> int:
@@ -267,7 +314,15 @@ def main(
         "--mark",
         nargs=2,
         metavar=("JOB_ID", "STATUS"),
-        help="append a status event for a full job UUID",
+        help=(
+            "append a status event using direct CLI compatibility inputs; values may be "
+            "visible in child argv and shell history"
+        ),
+    )
+    decision_actions.add_argument(
+        "--mark-json-stdin",
+        action="store_true",
+        help="read one private mark from stdin without putting its values in child argv",
     )
     decision_actions.add_argument(
         "--list-decisions",
@@ -303,29 +358,50 @@ def main(
     p.add_argument(
         "--include-decided",
         action="store_true",
-        help="include roles already marked shortlisted, applied or passed",
+        help="include roles with any saved status",
     )
     p.add_argument("--json", action="store_true", help="locally filtered JSON")
     a = p.parse_args(argv)
 
     state_file = decision_path(a.state_file)
     metadata = (a.date, a.note, a.reason, a.response_kind, a.contact_name)
+    if a.mark_json_stdin and any(value is not None for value in metadata):
+        print(
+            "Decision error: --mark-json-stdin conflicts with legacy metadata flags",
+            file=stderr,
+        )
+        return 2
     if any(value is not None for value in metadata) and not a.mark:
         print("Decision error: Event metadata may only be used with --mark", file=stderr)
         return 2
-    if a.mark:
-        job_id, status = a.mark
+    if a.mark or a.mark_json_stdin:
         try:
+            if a.mark_json_stdin:
+                mark = _read_mark_json_stdin(stdin)
+                job_id = mark["jobId"]
+                status = mark["status"]
+                event_date = mark.get("date")
+                note = mark.get("note")
+                reason = mark.get("rejectionReason")
+                response_kind = mark.get("responseKind")
+                contact_name = mark.get("contactName")
+            else:
+                job_id, status = a.mark
+                event_date = a.date
+                note = a.note
+                reason = a.reason
+                response_kind = a.response_kind
+                contact_name = a.contact_name
             job_id = normalize_job_id(job_id)
             recorded_at = now()
             event = validate_event_input(
                 status,
                 recorded_at,
-                a.date,
-                a.note,
-                a.reason,
-                a.response_kind,
-                a.contact_name,
+                event_date,
+                note,
+                reason,
+                response_kind,
+                contact_name,
             )
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
@@ -343,10 +419,17 @@ def main(
                 job=job,
                 now=recorded_at,
                 event_date=event["date"],
-                note=a.note,
-                rejection_reason=a.reason,
-                response_kind=a.response_kind,
-                contact_name=a.contact_name,
+                note=note,
+                rejection_reason=reason,
+                response_kind=response_kind,
+                contact_name=contact_name,
+            )
+        except DecisionStoreCommittedError as error:
+            record = error.committed_result
+            print(
+                "Warning: Change was saved, but decision-lock cleanup failed. "
+                "Inspect local history before attempting another update.",
+                file=stderr,
             )
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
@@ -407,6 +490,13 @@ def main(
             return 2
         try:
             removed = forget_decision(state_file, job_id)
+        except DecisionStoreCommittedError as error:
+            removed = error.committed_result
+            print(
+                "Warning: Change was saved, but decision-lock cleanup failed. "
+                "Inspect local history before attempting another update.",
+                file=stderr,
+            )
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
             return 1

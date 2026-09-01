@@ -247,11 +247,107 @@ def test_v1_mutation_accepts_an_identical_existing_backup(tmp_path):
     original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
     state_file.write_bytes(original)
     backup_file.write_bytes(original)
+    if os.name != "nt":
+        backup_file.chmod(0o600)
 
     record(decisions, state_file)
 
     assert backup_file.read_bytes() == original
     assert decisions.get_decision(state_file, JOB_ID)["status"] == "shortlisted"
+
+
+def test_v1_mutation_rejects_a_backup_symlink_to_the_source_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    try:
+        backup_file.symlink_to(state_file)
+    except OSError as error:
+        pytest.skip(f"symlinks are unavailable: {error}")
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert backup_file.is_symlink()
+
+
+def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    if os.name != "nt":
+        state_file.chmod(0o600)
+    try:
+        os.link(state_file, backup_file)
+    except OSError as error:
+        pytest.skip(f"hard links are unavailable: {error}")
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert os.path.samefile(state_file, backup_file)
+
+
+def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    backup_alias = tmp_path / "backup-alias"
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    backup_file.write_bytes(original)
+    if os.name != "nt":
+        backup_file.chmod(0o600)
+    try:
+        os.link(backup_file, backup_alias)
+    except OSError as error:
+        pytest.skip(f"hard links are unavailable: {error}")
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert backup_file.read_bytes() == original
+    assert os.path.samefile(backup_file, backup_alias)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not authoritative on Windows")
+def test_v1_mutation_rejects_a_group_or_other_accessible_existing_backup(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    backup_file.write_bytes(original)
+    backup_file.chmod(0o644)
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert backup_file.read_bytes() == original
+    assert stat.S_IMODE(backup_file.stat().st_mode) == 0o644
+
+
+def test_v1_mutation_rejects_a_non_regular_existing_backup(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    backup_file.mkdir()
+
+    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert backup_file.is_dir()
 
 
 def test_v1_mutation_rejects_a_different_existing_backup_without_changes(tmp_path):
@@ -262,6 +358,8 @@ def test_v1_mutation_rejects_a_different_existing_backup_without_changes(tmp_pat
     conflicting_backup = b"different backup\n"
     state_file.write_bytes(original)
     backup_file.write_bytes(conflicting_backup)
+    if os.name != "nt":
+        backup_file.chmod(0o600)
 
     with pytest.raises(decisions.DecisionStoreError, match="backup"):
         record(decisions, state_file)
@@ -354,6 +452,105 @@ def test_lock_cleanup_attempts_close_when_unlock_and_close_fail(tmp_path, monkey
                 real_unlock(fd, msvcrt.LK_UNLCK, 1)
             else:
                 real_unlock(fd, fcntl.LOCK_UN)
+            real_close(fd)
+
+
+def test_unlock_failure_with_successful_close_does_not_fail_a_committed_record(
+    tmp_path, monkeypatch
+):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+
+    if os.name == "nt":
+        import msvcrt
+
+        real_unlock = msvcrt.locking
+
+        def fail_unlock(fd, mode, size):
+            if mode == msvcrt.LK_UNLCK:
+                raise OSError("unlock failed")
+            return real_unlock(fd, mode, size)
+
+        monkeypatch.setattr(msvcrt, "locking", fail_unlock)
+    else:
+        import fcntl
+
+        real_unlock = fcntl.flock
+
+        def fail_unlock(fd, operation):
+            if operation == fcntl.LOCK_UN:
+                raise OSError("unlock failed")
+            return real_unlock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", fail_unlock)
+
+    result = record(decisions, state_file)
+
+    assert result["status"] == "shortlisted"
+    assert len(decisions.get_decision(state_file, JOB_ID)["history"]) == 1
+
+
+def test_close_failure_after_commit_exposes_the_committed_result(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    lock_fds = []
+    real_open = decisions.os.open
+    real_close = decisions.os.close
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == lock_file:
+            lock_fds.append(fd)
+        return fd
+
+    def fail_lock_close(fd):
+        if fd in lock_fds:
+            raise OSError("close failed")
+        return real_close(fd)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(decisions.os, "open", track_open)
+            patch.setattr(decisions.os, "close", fail_lock_close)
+            with pytest.raises(decisions.DecisionStoreCommittedError) as raised:
+                record(decisions, state_file)
+
+        assert raised.value.committed_result["status"] == "shortlisted"
+        assert len(decisions.get_decision(state_file, JOB_ID)["history"]) == 1
+    finally:
+        for fd in lock_fds:
+            real_close(fd)
+
+
+def test_lock_cleanup_does_not_mask_a_primary_body_error(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    lock_fds = []
+    real_open = decisions.os.open
+    real_close = decisions.os.close
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == lock_file:
+            lock_fds.append(fd)
+        return fd
+
+    def fail_lock_close(fd):
+        if fd in lock_fds:
+            raise OSError("close failed")
+        return real_close(fd)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(decisions.os, "open", track_open)
+            patch.setattr(decisions.os, "close", fail_lock_close)
+            with pytest.raises(decisions.DecisionStoreError, match="primary body failure"):
+                with decisions._store_lock(state_file):
+                    raise decisions.DecisionStoreError("primary body failure")
+    finally:
+        for fd in lock_fds:
             real_close(fd)
 
 
@@ -562,6 +759,10 @@ def test_atomic_write_failures_keep_source_intact(tmp_path, monkeypatch, boundar
         ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "title": ["Role"]}}}, "invalid title"),
         ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "company": "Company\x1b"}}}, "invalid company"),
         ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "pegelUrl": "https://evil.example/role"}}}, "invalid pegelUrl"),
+        ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "history": [{**v2_record()["history"][0], "note": None}]}}}, "invalid note"),
+        ({"version": 2, "jobs": {JOB_ID: {**v2_record(status="rejected"), "history": [{**v2_record(status="rejected")["history"][0], "rejectionReason": None}]}}}, "invalid rejectionReason"),
+        ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "history": [{**v2_record()["history"][0], "responseKind": None}]}}}, "invalid responseKind"),
+        ({"version": 2, "jobs": {JOB_ID: {**v2_record(), "history": [{**v2_record()["history"][0], "contactName": None}]}}}, "invalid contactName"),
     ],
 )
 def test_load_decisions_rejects_malformed_v2_state_without_rewriting_it(tmp_path, payload, message):
@@ -659,6 +860,22 @@ def test_forget_decision_returns_the_job_to_future_searches(tmp_path):
     assert decisions.forget_decision(state_file, JOB_ID) is True
     assert decisions.load_decisions(state_file)["jobs"] == {}
     assert decisions.forget_decision(state_file, JOB_ID) is False
+
+
+def test_forget_removes_only_the_active_log_and_retains_an_exact_v1_backup(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({
+        "version": 1,
+        "jobs": {JOB_ID: {"verdict": "passed", "updatedAt": "2026-09-01T08:30:00Z"}},
+    }).encode("utf-8")
+    state_file.write_bytes(original)
+
+    assert decisions.forget_decision(state_file, JOB_ID) is True
+
+    assert decisions.load_decisions(state_file)["jobs"] == {}
+    assert backup_file.read_bytes() == original
 
 
 def test_decision_path_supports_an_explicit_override_and_xdg_storage(tmp_path, monkeypatch):

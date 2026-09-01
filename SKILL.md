@@ -79,30 +79,40 @@ only a candidate-explicit fact, using the status that matches what they said:
 `passed` is the candidate's decision not to pursue a role, never interview success. When someone
 says they passed an interview stage, explicitly explain that `passed` is reserved for choosing not
 to pursue, then offer `interviewing` only if they want that recorded. Silence is not a rejection.
-If a statement could map to more than one status, ask for confirmation before running `--mark`.
+If a statement could map to more than one status, ask for confirmation before preparing a mark.
 
 Append an event, backfill its factual date, review the timeline, list statuses, or remove the role:
 
 ```bash
-python3 scripts/pegel_query.py --mark <job-id> <status>
-python3 scripts/pegel_query.py --mark <job-id> rejected --date 2026-08-31 --reason "Role was filled" --response-kind human --contact-name "Alex"
+python3 scripts/pegel_query.py --mark-json-stdin
 python3 scripts/pegel_query.py --list-decisions shortlisted
 python3 scripts/pegel_query.py --list-decisions all
 python3 scripts/pegel_query.py --history <job-id>
 python3 scripts/pegel_query.py --forget <job-id>
 ```
 
-Use `--date` only for a factual backfill. Pass only candidate-approved short summaries to `--note`
-or `--reason`. A rejection reason must be the candidate's own short summary, never an inference
-from Pegel, the job description, silence, or raw correspondence. Never store a raw message, email
-address, attachment, or mailbox identifier. A short note, rejection reason, response kind, and
-contact name are allowed locally only when the candidate explicitly supplies or approves them.
+For a mark, first build one exact candidate-approved JSON object with `jobId`, `status`, and only
+the approved optional fields: `date`, `note`, `rejectionReason`, `responseKind`, or `contactName`.
+Use `--mark-json-stdin` only when the host provides a structural stdin channel. Never interpolate
+private values into shell command text, including a pipe, heredoc, environment assignment, or
+quoted argument. If structural stdin is unavailable, present the exact candidate-approved JSON and
+ask the candidate to run the interactive stdin command locally. Stdin keeps values out of child
+argv, but it cannot prevent host transcript or output capture. Do not claim more about the host.
+
+Use the JSON `date` field only for a factual backfill. Put only candidate-approved short summaries
+in `note` or `rejectionReason`. A rejection reason must be the candidate's own short summary, never
+an inference from Pegel, the job description, silence, or raw correspondence. Never store a raw
+message, email address, attachment, or mailbox identifier. A short note, rejection reason, response
+kind, and contact name are allowed locally only when the candidate explicitly supplies or approves
+them.
 
 The default file is `~/.local/share/pegel/job-decisions.json`, or
 `$XDG_DATA_HOME/pegel/job-decisions.json` when that variable is set. `--list-decisions` and
-`--history` are offline. `--mark` may make only the normal public UUID detail read for the title and
+`--history` are offline. A mark may make only the normal public UUID detail read for the title and
 link; if it fails, the event is still saved without a snapshot. Status and metadata never leave the
-machine. Read [README.md](README.md) for the command and schema reference.
+machine. `--forget` removes a role only from the active log. A sensitive `.v1.bak` migration backup
+is never automatically rewritten or deleted. Read [README.md](README.md) for the command and schema
+reference.
 
 ### 2. Fit
 

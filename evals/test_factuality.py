@@ -17,8 +17,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from pegel_query import blue_card, salary_text  # noqa: E402
 
 
-SKILL_TEXT = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+ROOT = Path(__file__).resolve().parents[1]
+SKILL_TEXT = (ROOT / "SKILL.md").read_text(encoding="utf-8")
 SKILL_TEXT_LOWER = " ".join(SKILL_TEXT.lower().split())
+README_TEXT_LOWER = " ".join((ROOT / "README.md").read_text(encoding="utf-8").lower().split())
+TRUST_TEXT_LOWER = " ".join(
+    (ROOT / "references" / "trust-policy.md").read_text(encoding="utf-8").lower().split()
+)
+API_TEXT_LOWER = " ".join(
+    (ROOT / "references" / "pegel-api.md").read_text(encoding="utf-8").lower().split()
+)
+DESIGN_TEXT_LOWER = " ".join(
+    (ROOT / "docs" / "superpowers" / "specs" / "2026-09-01-job-log-v2-design.md")
+    .read_text(encoding="utf-8")
+    .lower()
+    .split()
+)
+PLAN_TEXT_LOWER = " ".join(
+    (ROOT / "docs" / "superpowers" / "plans" / "2026-09-01-job-log-v2.md")
+    .read_text(encoding="utf-8")
+    .lower()
+    .split()
+)
 
 
 def job(**over):
@@ -144,6 +164,38 @@ def test_skill_forbids_raw_correspondence_and_mailbox_identifiers():
 
 def test_skill_keeps_status_and_event_metadata_off_pegel():
     assert "status and metadata never leave the machine" in SKILL_TEXT_LOWER
+
+
+def test_skill_uses_only_structural_stdin_for_agent_private_marks():
+    assert "python3 scripts/pegel_query.py --mark-json-stdin" in SKILL_TEXT_LOWER
+    assert "structural stdin" in SKILL_TEXT_LOWER
+    assert "never interpolate private values into shell command text" in SKILL_TEXT_LOWER
+    assert "exact candidate-approved json" in SKILL_TEXT_LOWER
+    assert "ask the candidate to run" in SKILL_TEXT_LOWER
+    assert "host transcript or output capture" in SKILL_TEXT_LOWER
+    assert "python3 scripts/pegel_query.py --mark <" not in SKILL_TEXT_LOWER
+
+
+def test_docs_distinguish_private_stdin_from_process_visible_legacy_marking():
+    for text in (README_TEXT_LOWER, API_TEXT_LOWER, DESIGN_TEXT_LOWER, PLAN_TEXT_LOWER):
+        assert "--mark-json-stdin" in text
+        assert "child argv" in text
+        assert "legacy" in text
+        assert "process" in text
+
+
+def test_docs_state_forget_retains_the_sensitive_migration_backup():
+    for text in (
+        README_TEXT_LOWER,
+        SKILL_TEXT_LOWER,
+        TRUST_TEXT_LOWER,
+        DESIGN_TEXT_LOWER,
+        PLAN_TEXT_LOWER,
+    ):
+        assert "active log" in text
+        assert ".v1.bak" in text
+        assert "sensitive" in text
+        assert "never automatically" in text
 
 
 def test_skill_reuses_the_known_job_id_unless_the_role_is_ambiguous():
