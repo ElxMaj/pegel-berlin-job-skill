@@ -245,8 +245,12 @@ def _store_lock(path: Path):
     path = Path(path)
     lock_path = Path(f"{path}.lock")
     try:
-        parent_created = not path.parent.exists()
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_created = False
+        try:
+            path.parent.mkdir(mode=0o700, parents=True)
+            parent_created = True
+        except FileExistsError:
+            pass
         if parent_created:
             os.chmod(path.parent, 0o700)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -274,6 +278,7 @@ def _store_lock(path: Path):
             raise DecisionStoreError(f"Could not lock decision file: {lock_path}") from error
         yield
     finally:
+        cleanup_error = None
         try:
             if acquired:
                 if os.name == "nt":
@@ -285,9 +290,18 @@ def _store_lock(path: Path):
                     import fcntl
 
                     fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
         except OSError as error:
-            raise DecisionStoreError(f"Could not release decision lock: {lock_path}") from error
+            cleanup_error = error
+        finally:
+            try:
+                os.close(fd)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise DecisionStoreError(
+                f"Could not release decision lock: {lock_path}"
+            ) from cleanup_error
 
 
 def _ensure_v1_backup(path: Path, source_bytes: bytes) -> None:
@@ -312,16 +326,22 @@ def _ensure_v1_backup(path: Path, source_bytes: bytes) -> None:
     except DecisionStoreError:
         raise
     except (OSError, UnicodeError) as error:
+        cleanup_error = None
         if fd is not None:
             try:
                 os.close(fd)
-            except OSError:
-                pass
+            except OSError as cleanup_failure:
+                cleanup_error = cleanup_failure
         if created:
             try:
                 backup_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_failure:
+                if cleanup_error is None:
+                    cleanup_error = cleanup_failure
+        if cleanup_error is not None:
+            raise DecisionStoreError(
+                f"Could not clean up decision backup: {backup_path}"
+            ) from cleanup_error
         raise DecisionStoreError(f"Could not create decision backup: {backup_path}") from error
 
 
@@ -344,16 +364,22 @@ def _atomic_write(path: Path, store: dict) -> None:
     except (OSError, UnicodeError, TypeError, ValueError, OverflowError) as error:
         raise DecisionStoreError(f"Could not write decision file: {path}") from error
     finally:
+        cleanup_error = None
         if fd is not None:
             try:
                 os.close(fd)
             except OSError as error:
-                raise DecisionStoreError(f"Could not clean up decision write: {path}") from error
+                cleanup_error = error
         if temporary_path is not None:
             try:
                 temporary_path.unlink(missing_ok=True)
             except OSError as error:
-                raise DecisionStoreError(f"Could not clean up decision write: {path}") from error
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise DecisionStoreError(
+                f"Could not clean up decision write: {path}"
+            ) from cleanup_error
 
 
 def _event_input(

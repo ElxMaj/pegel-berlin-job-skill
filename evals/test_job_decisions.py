@@ -291,6 +291,110 @@ def test_mutation_reports_lock_contention_without_changing_source(tmp_path):
     assert state_file.read_bytes() == original
 
 
+def test_lock_cleanup_attempts_close_when_unlock_and_close_fail(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    original = b"original source\n"
+    state_file.write_bytes(original)
+    opened = []
+    unlock_attempts = []
+    close_attempts = []
+    real_open = decisions.os.open
+    real_close = decisions.os.close
+
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def fail_close(fd):
+        close_attempts.append(fd)
+        raise OSError("close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(decisions.os, "open", track_open)
+        patch.setattr(decisions.os, "close", fail_close)
+        if os.name == "nt":
+            import msvcrt
+
+            real_unlock = msvcrt.locking
+
+            def fail_unlock(fd, mode, size):
+                if mode == msvcrt.LK_UNLCK:
+                    unlock_attempts.append(fd)
+                    raise OSError("unlock failed")
+                return real_unlock(fd, mode, size)
+
+            patch.setattr(msvcrt, "locking", fail_unlock)
+        else:
+            import fcntl
+
+            real_unlock = fcntl.flock
+
+            def fail_unlock(fd, operation):
+                if operation == fcntl.LOCK_UN:
+                    unlock_attempts.append(fd)
+                    raise OSError("unlock failed")
+                return real_unlock(fd, operation)
+
+            patch.setattr(fcntl, "flock", fail_unlock)
+
+        with pytest.raises(decisions.DecisionStoreError, match="release"):
+            with decisions._store_lock(state_file):
+                pass
+
+    try:
+        assert unlock_attempts == opened
+        assert close_attempts == opened
+        assert state_file.read_bytes() == original
+    finally:
+        for fd in opened:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                real_unlock(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                real_unlock(fd, fcntl.LOCK_UN)
+            real_close(fd)
+
+
+def test_parent_creation_race_does_not_chmod_an_existing_directory(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    parent = tmp_path / "raced"
+    state_file = parent / "job-decisions.json"
+    real_exists = Path.exists
+    real_mkdir = Path.mkdir
+    real_chmod = decisions.os.chmod
+    parent_chmods = []
+
+    def report_parent_missing(path):
+        if path == parent:
+            return False
+        return real_exists(path)
+
+    def race_mkdir(path, *args, **kwargs):
+        if path == parent and not real_exists(parent):
+            real_mkdir(parent, mode=0o755, parents=True, exist_ok=True)
+            if not kwargs.get("exist_ok", False):
+                raise FileExistsError(parent)
+            return None
+        return real_mkdir(path, *args, **kwargs)
+
+    def track_chmod(path, mode):
+        if Path(path) == parent:
+            parent_chmods.append(mode)
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "exists", report_parent_missing)
+    monkeypatch.setattr(Path, "mkdir", race_mkdir)
+    monkeypatch.setattr(decisions.os, "chmod", track_chmod)
+
+    record(decisions, state_file)
+
+    assert parent_chmods == []
+    if os.name != "nt":
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+
+
 def test_backup_creation_failure_keeps_v1_source_intact(tmp_path, monkeypatch):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
@@ -309,6 +413,107 @@ def test_backup_creation_failure_keeps_v1_source_intact(tmp_path, monkeypatch):
         record(decisions, state_file)
 
     assert state_file.read_bytes() == original
+
+
+def test_backup_cleanup_attempts_unlink_and_fails_loud(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    backup_file = Path(f"{state_file}.v1.bak")
+    original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
+    state_file.write_bytes(original)
+    opened = []
+    close_attempts = []
+    unlink_attempts = []
+    real_open = decisions.os.open
+    real_close = decisions.os.close
+    real_unlink = Path.unlink
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == backup_file:
+            opened.append(fd)
+        return fd
+
+    def fail_fdopen(*_args, **_kwargs):
+        raise OSError("fdopen failed")
+
+    def fail_close(fd):
+        close_attempts.append(fd)
+        raise OSError("close failed")
+
+    def fail_unlink(path, *args, **kwargs):
+        if path == backup_file:
+            unlink_attempts.append(path)
+            raise OSError("unlink failed")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(decisions.os, "open", track_open)
+        patch.setattr(decisions.os, "fdopen", fail_fdopen)
+        patch.setattr(decisions.os, "close", fail_close)
+        patch.setattr(Path, "unlink", fail_unlink)
+        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+            decisions._ensure_v1_backup(state_file, original)
+
+    try:
+        assert close_attempts == opened
+        assert unlink_attempts == [backup_file]
+        assert state_file.read_bytes() == original
+        assert backup_file.exists()
+    finally:
+        for fd in opened:
+            real_close(fd)
+        real_unlink(backup_file, missing_ok=True)
+
+
+def test_atomic_cleanup_attempts_unlink_when_descriptor_close_fails(tmp_path, monkeypatch):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    original = b"original source\n"
+    state_file.write_bytes(original)
+    opened = []
+    temporary_paths = []
+    close_attempts = []
+    unlink_attempts = []
+    real_mkstemp = decisions.tempfile.mkstemp
+    real_close = decisions.os.close
+    real_unlink = Path.unlink
+
+    def track_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        opened.append(fd)
+        temporary_paths.append(Path(name))
+        return fd, name
+
+    def fail_fdopen(*_args, **_kwargs):
+        raise OSError("fdopen failed")
+
+    def fail_close(fd):
+        close_attempts.append(fd)
+        raise OSError("close failed")
+
+    def track_unlink(path, *args, **kwargs):
+        if path in temporary_paths:
+            unlink_attempts.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(decisions.tempfile, "mkstemp", track_mkstemp)
+        patch.setattr(decisions.os, "fdopen", fail_fdopen)
+        patch.setattr(decisions.os, "close", fail_close)
+        patch.setattr(Path, "unlink", track_unlink)
+        with pytest.raises(decisions.DecisionStoreError, match="write"):
+            decisions._atomic_write(state_file, {"version": 2, "jobs": {}})
+
+    try:
+        assert close_attempts == opened
+        assert unlink_attempts == temporary_paths
+        assert state_file.read_bytes() == original
+    finally:
+        for fd in opened:
+            real_close(fd)
+        for path in temporary_paths:
+            real_unlink(path, missing_ok=True)
 
 
 @pytest.mark.parametrize(
