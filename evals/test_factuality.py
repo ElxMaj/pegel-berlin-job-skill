@@ -122,6 +122,14 @@ def test_skill_defines_passed_as_non_pursuit_not_interview_success():
     assert "never means they passed an interview stage" in SKILL_TEXT_LOWER
 
 
+def test_skill_explains_passed_before_offering_interviewing():
+    assert (
+        "when someone says they passed an interview stage, explicitly explain that `passed` is "
+        "reserved for choosing not to pursue, then offer `interviewing` only if they want that "
+        "recorded"
+    ) in SKILL_TEXT_LOWER
+
+
 def test_skill_requires_confirmation_instead_of_inferring_an_outcome():
     assert "record only a candidate-explicit fact" in SKILL_TEXT_LOWER
     assert "silence is not a rejection" in SKILL_TEXT_LOWER

@@ -76,10 +76,10 @@ only a candidate-explicit fact, using the status that matches what they said:
 | I withdrew my application | `withdrawn` |
 | I chose not to pursue this role | `passed` |
 
-`passed` is the candidate's decision not to pursue a role, never interview success. If they say
-they passed an interview stage, offer `interviewing` only if they want that recorded. Silence is
-not a rejection. If a statement could map to more than one status, ask for confirmation before
-running `--mark`.
+`passed` is the candidate's decision not to pursue a role, never interview success. When someone
+says they passed an interview stage, explicitly explain that `passed` is reserved for choosing not
+to pursue, then offer `interviewing` only if they want that recorded. Silence is not a rejection.
+If a statement could map to more than one status, ask for confirmation before running `--mark`.
 
 Append an event, backfill its factual date, review the timeline, list statuses, or remove the role:
 
