@@ -1,5 +1,6 @@
 import json
 import sys
+from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -10,6 +11,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import pegel_query  # noqa: E402
+import job_decisions  # noqa: E402
 from job_decisions import record_decision  # noqa: E402
 
 
@@ -105,7 +107,7 @@ def test_collect_jobs_can_include_decided_roles_for_an_explicit_review():
     assert calls == [{"page": "1", "pageSize": "100"}]
 
 
-def test_mark_command_saves_the_verdict_locally_without_sending_it_to_the_api(tmp_path):
+def test_mark_command_saves_the_status_locally_without_sending_it_to_the_api(tmp_path):
     state_file = tmp_path / "job-decisions.json"
     api_reads = []
     stdout = StringIO()
@@ -124,7 +126,7 @@ def test_mark_command_saves_the_verdict_locally_without_sending_it_to_the_api(tm
     assert exit_code == 0
     assert api_reads == [IDS[0]]
     assert "shortlisted" in stdout.getvalue()
-    assert '"verdict": "shortlisted"' in state_file.read_text()
+    assert '"status": "shortlisted"' in state_file.read_text()
 
 
 def test_mark_command_uses_a_normal_read_to_keep_a_local_job_snapshot(tmp_path, monkeypatch):
@@ -256,7 +258,7 @@ def test_mark_command_keeps_the_local_decision_when_snapshot_read_fails(tmp_path
         raise pegel_query.PegelApiError("Could not reach Pegel")
 
     exit_code = pegel_query.main(
-        ["--state-file", str(state_file), "--mark", IDS[0], "passed"],
+        ["--state-file", str(state_file), "--mark", IDS[0], "passed", "--json"],
         fetch_detail=offline,
         now=lambda: "2026-09-01T08:30:00Z",
         stdout=stdout,
@@ -264,11 +266,62 @@ def test_mark_command_keeps_the_local_decision_when_snapshot_read_fails(tmp_path
     )
 
     assert exit_code == 0
-    assert "Marked" in stdout.getvalue()
+    assert json.loads(stdout.getvalue())["data"]["status"] == "passed"
     assert "saved without a job snapshot" in stderr.getvalue()
     saved = json.loads(state_file.read_text())["jobs"][IDS[0]]
-    assert saved["verdict"] == "passed"
-    assert saved["title"] is None
+    assert saved["status"] == "passed"
+    assert "title" not in saved
+
+
+@pytest.mark.parametrize(
+    "malformed_snapshot",
+    [
+        {"title": ["Not text"]},
+        {"company": "Not an object"},
+        {"company": {"slug": "example", "name": ["Not text"]}},
+        {"pegelUrl": "https://evil.example/jobs/role"},
+    ],
+)
+def test_malformed_public_snapshot_saves_private_mark_without_snapshot_or_metadata_request(
+    tmp_path, monkeypatch, malformed_snapshot
+):
+    state_file = tmp_path / "job-decisions.json"
+    calls = []
+    stderr = StringIO()
+    private_payload = {
+        "jobId": IDS[0],
+        "status": "rejected",
+        "note": "Private follow up",
+        "rejectionReason": "Private reason",
+        "responseKind": "human",
+        "contactName": "Private contact",
+    }
+    malformed_job = api_job(IDS[0], "Saved role")
+    malformed_job.update(malformed_snapshot)
+
+    def fetch_json(url, **kwargs):
+        calls.append((url, kwargs))
+        return {"data": malformed_job}
+
+    monkeypatch.setattr(pegel_query, "_fetch_json", fetch_json)
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin"],
+        stdin=StringIO(json.dumps(private_payload)),
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    saved = json.loads(state_file.read_text())["jobs"][IDS[0]]
+    assert calls == [(f"{pegel_query.API}/{IDS[0]}", {"allow_not_found": True})]
+    assert "Private" not in repr(calls)
+    assert "saved without a job snapshot" in stderr.getvalue()
+    assert saved["history"][0]["note"] == "Private follow up"
+    assert saved["history"][0]["rejectionReason"] == "Private reason"
+    assert saved["history"][0]["contactName"] == "Private contact"
+    assert not {"title", "company", "pegelUrl"} & set(saved)
 
 
 @pytest.mark.parametrize("read_result", [b"\xff", OSError("response body read failed")])
@@ -307,10 +360,10 @@ def test_mark_command_keeps_the_decision_when_the_http_body_cannot_be_read(
 
     assert exit_code == 0
     assert "saved without a job snapshot" in stderr.getvalue()
-    assert json.loads(state_file.read_text())["jobs"][IDS[0]]["verdict"] == "shortlisted"
+    assert json.loads(state_file.read_text())["jobs"][IDS[0]]["status"] == "shortlisted"
 
 
-def test_invalid_verdict_is_rejected_before_any_api_read(tmp_path):
+def test_unknown_status_is_rejected_before_any_api_read(tmp_path):
     state_file = tmp_path / "job-decisions.json"
     api_reads = []
     stderr = StringIO()
@@ -320,7 +373,7 @@ def test_invalid_verdict_is_rejected_before_any_api_read(tmp_path):
         return api_job(job_id, "Role")
 
     exit_code = pegel_query.main(
-        ["--state-file", str(state_file), "--mark", IDS[0], "rejected"],
+        ["--state-file", str(state_file), "--mark", IDS[0], "unknown"],
         fetch_detail=fetch_detail,
         stdout=StringIO(),
         stderr=stderr,
@@ -328,7 +381,7 @@ def test_invalid_verdict_is_rejected_before_any_api_read(tmp_path):
 
     assert exit_code == 2
     assert api_reads == []
-    assert "shortlisted, applied, passed" in stderr.getvalue()
+    assert "shortlisted, applied, interviewing, offered, accepted, rejected, withdrawn, passed" in stderr.getvalue()
     assert not state_file.exists()
 
 
@@ -514,3 +567,418 @@ def test_include_decided_flag_is_wired_through_the_search_command(tmp_path):
     assert exit_code == 0
     assert [job["id"] for job in payload["data"]] == [IDS[0]]
     assert payload["selection"]["decidedFiltering"] is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "shortlisted",
+        "applied",
+        "interviewing",
+        "offered",
+        "accepted",
+        "rejected",
+        "withdrawn",
+        "passed",
+    ],
+)
+def test_mark_command_supports_the_complete_status_vocabulary(tmp_path, status):
+    stdout = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / f"{status}.json"), "--mark", IDS[0], status],
+        fetch_detail=lambda _job_id: None,
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert status in stdout.getvalue()
+    if status == "passed":
+        assert "you chose not to pursue this role" in stdout.getvalue().lower()
+        assert "interview" not in stdout.getvalue().lower()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--date", "2026-09-01"],
+        ["--note", "Follow up"],
+        ["--reason", "Position filled"],
+        ["--response-kind", "human"],
+        ["--contact-name", "Alex"],
+        ["--mark", IDS[0], "applied", "--reason", "Position filled"],
+        ["--mark", IDS[0], "applied", "--date", "2026-02-30"],
+        ["--mark", IDS[0], "applied", "--response-kind", "bot"],
+        ["--mark", IDS[0], "applied", "--note", "x" * 4001],
+        ["--mark", IDS[0], "rejected", "--reason", "x" * 1001],
+        ["--mark", IDS[0], "applied", "--contact-name", "x" * 201],
+        ["--mark", IDS[0], "applied", "--note", "unsafe\x00"],
+        ["--mark", "f623bce6", "applied"],
+        ["--mark", IDS[0], "unknown"],
+    ],
+)
+def test_invalid_local_arguments_are_rejected_before_network_or_write(tmp_path, arguments):
+    state_file = tmp_path / "job-decisions.json"
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    stderr = StringIO()
+
+    def unexpected_detail(_job_id):
+        raise AssertionError("invalid input must not call Pegel")
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), *arguments],
+        fetch_detail=unexpected_detail,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert "Decision error:" in stderr.getvalue()
+    assert state_file.read_bytes() == original
+
+
+def test_mark_json_has_one_data_envelope_and_keeps_metadata_out_of_the_request(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    requested = []
+    stdout = StringIO()
+    now_calls = []
+
+    def fetch_detail(job_id):
+        requested.append(job_id)
+        return api_job(job_id, "Saved role")
+
+    def now():
+        now_calls.append(True)
+        return "2026-09-01T08:30:00Z"
+
+    exit_code = pegel_query.main(
+        [
+            "--state-file", str(state_file),
+            "--mark", IDS[0].upper(), "rejected",
+            "--date", "2026-08-31",
+            "--note", "Follow up next quarter",
+            "--reason", "Position filled",
+            "--response-kind", "human",
+            "--contact-name", "Alex Martin",
+            "--json",
+        ],
+        fetch_detail=fetch_detail,
+        now=now,
+        stdout=stdout,
+    )
+
+    complete_record = {
+        "id": IDS[0],
+        "status": "rejected",
+        "updatedAt": "2026-09-01T08:30:00Z",
+        "history": [{
+            "status": "rejected",
+            "date": "2026-08-31",
+            "recordedAt": "2026-09-01T08:30:00Z",
+            "note": "Follow up next quarter",
+            "rejectionReason": "Position filled",
+            "responseKind": "human",
+            "contactName": "Alex Martin",
+        }],
+        "title": "Saved role",
+        "company": "Example GmbH",
+        "pegelUrl": f"https://pegel.berlin/jobs/saved-role-{IDS[0][:8]}",
+    }
+    assert exit_code == 0
+    assert requested == [IDS[0]]
+    assert len(now_calls) == 1
+    assert json.loads(stdout.getvalue()) == {"data": complete_record}
+
+
+def test_mark_json_stdin_keeps_the_complete_private_mark_out_of_child_argv(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    requested = []
+    stdout = StringIO()
+    payload = {
+        "jobId": IDS[0].upper(),
+        "status": "rejected",
+        "date": "2026-08-31",
+        "note": "Follow up next quarter",
+        "rejectionReason": "Position filled",
+        "responseKind": "human",
+        "contactName": "Alex Martin",
+    }
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin", "--json"],
+        stdin=StringIO(json.dumps(payload)),
+        fetch_detail=lambda job_id: requested.append(job_id) or api_job(job_id, "Saved role"),
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=stdout,
+    )
+
+    saved = json.loads(stdout.getvalue())["data"]
+    assert exit_code == 0
+    assert requested == [IDS[0]]
+    assert saved["history"] == [{
+        "status": "rejected",
+        "date": "2026-08-31",
+        "recordedAt": "2026-09-01T08:30:00Z",
+        "note": "Follow up next quarter",
+        "rejectionReason": "Position filled",
+        "responseKind": "human",
+        "contactName": "Alex Martin",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("raw_payload", "message"),
+    [
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "extra": True}), "unknown"),
+        (json.dumps({"status": "shortlisted"}), "jobId"),
+        (json.dumps({"jobId": IDS[0]}), "status"),
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "note": None}), "null"),
+        (json.dumps([{"jobId": IDS[0], "status": "shortlisted"}]), "object"),
+        ("{} {}", "JSON"),
+        (json.dumps({"jobId": IDS[0], "status": "shortlisted", "note": "x" * 4001}), "note"),
+        ("x" * 20_000, "large"),
+    ],
+)
+def test_invalid_mark_json_stdin_is_rejected_before_network_or_write(
+    tmp_path, raw_payload, message
+):
+    state_file = tmp_path / "job-decisions.json"
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin"],
+        stdin=StringIO(raw_payload),
+        fetch_detail=lambda _job_id: pytest.fail("invalid stdin must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert message.lower() in stderr.getvalue().lower()
+    assert state_file.read_bytes() == original
+
+
+def test_mark_json_stdin_rejects_legacy_metadata_flags_before_network_or_write(tmp_path):
+    state_file = tmp_path / "job-decisions.json"
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin", "--note", "argv value"],
+        stdin=StringIO(json.dumps({"jobId": IDS[0], "status": "shortlisted"})),
+        fetch_detail=lambda _job_id: pytest.fail("conflicting input must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert "conflict" in stderr.getvalue().lower()
+    assert not state_file.exists()
+
+
+def test_mark_json_stdin_does_not_echo_an_unknown_control_character_key(tmp_path):
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / "decisions.json"), "--mark-json-stdin"],
+        stdin=StringIO(json.dumps({
+            "jobId": IDS[0],
+            "status": "shortlisted",
+            "unknown\x1b[31m": "value",
+        })),
+        fetch_detail=lambda _job_id: pytest.fail("invalid stdin must not call Pegel"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert stderr.getvalue() == "Decision error: Mark JSON has unknown fields\n"
+
+
+def test_committed_mark_cleanup_failure_returns_success_without_inviting_a_blind_retry(
+    tmp_path, monkeypatch
+):
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    lock_fds = []
+    real_open = job_decisions.os.open
+    real_close = job_decisions.os.close
+    stdout = StringIO()
+    stderr = StringIO()
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == lock_file:
+            lock_fds.append(fd)
+        return fd
+
+    def fail_lock_close(fd):
+        if fd in lock_fds:
+            raise OSError("close failed")
+        return real_close(fd)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(job_decisions.os, "open", track_open)
+            patch.setattr(job_decisions.os, "close", fail_lock_close)
+            exit_code = pegel_query.main(
+                ["--state-file", str(state_file), "--mark-json-stdin"],
+                stdin=StringIO(json.dumps({"jobId": IDS[0], "status": "shortlisted"})),
+                fetch_detail=lambda _job_id: None,
+                now=lambda: "2026-09-01T08:30:00Z",
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        assert exit_code == 0
+        assert "change was saved" in stderr.getvalue().lower()
+        assert "inspect" in stderr.getvalue().lower()
+        assert "before" in stderr.getvalue().lower()
+        assert "decision error" not in stderr.getvalue().lower()
+        assert len(json.loads(state_file.read_text())["jobs"][IDS[0]]["history"]) == 1
+    finally:
+        for fd in lock_fds:
+            real_close(fd)
+
+
+def test_help_describes_private_mark_transport_and_all_saved_status_filtering():
+    output = StringIO()
+
+    with redirect_stdout(output), pytest.raises(SystemExit) as raised:
+        pegel_query.main(["--help"])
+
+    help_text = output.getvalue().lower()
+    assert raised.value.code == 0
+    assert "--mark-json-stdin" in help_text
+    assert "child argv" in help_text
+    assert "direct cli compatibility" in help_text
+    assert "any saved status" in help_text
+
+
+def test_list_history_and_forget_json_envelopes_are_stable_and_offline(tmp_path, monkeypatch):
+    state_file = tmp_path / "job-decisions.json"
+    complete_record = record_decision(
+        state_file,
+        IDS[0],
+        "shortlisted",
+        job=api_job(IDS[0], "Saved role"),
+        now="2026-09-01T08:30:00Z",
+        event_date="2026-09-01",
+    )
+
+    def unexpected_api_call(*_args, **_kwargs):
+        raise AssertionError("local reads must not call Pegel")
+
+    monkeypatch.setattr(pegel_query, "fetch", unexpected_api_call)
+    monkeypatch.setattr(pegel_query, "fetch_job", unexpected_api_call)
+
+    list_stdout = StringIO()
+    assert pegel_query.main(
+        ["--state-file", str(state_file), "--list-decisions", "shortlisted", "--json"],
+        stdout=list_stdout,
+    ) == 0
+    assert json.loads(list_stdout.getvalue()) == {
+        "data": [complete_record],
+        "selection": {"status": "shortlisted", "returned": 1},
+    }
+
+    all_stdout = StringIO()
+    assert pegel_query.main(
+        ["--state-file", str(state_file), "--list-decisions", "all", "--json"],
+        stdout=all_stdout,
+    ) == 0
+    assert json.loads(all_stdout.getvalue())["selection"]["status"] == "all"
+
+    history_stdout = StringIO()
+    assert pegel_query.main(
+        ["--state-file", str(state_file), "--history", IDS[0].upper(), "--json"],
+        stdout=history_stdout,
+    ) == 0
+    assert json.loads(history_stdout.getvalue()) == {"data": complete_record}
+
+    forget_stdout = StringIO()
+    assert pegel_query.main(
+        ["--state-file", str(state_file), "--forget", IDS[0].upper(), "--json"],
+        stdout=forget_stdout,
+    ) == 0
+    assert json.loads(forget_stdout.getvalue()) == {
+        "data": {"id": IDS[0], "forgotten": True},
+    }
+
+
+def test_history_is_offline_chronological_and_indents_every_metadata_line(tmp_path, monkeypatch):
+    state_file = tmp_path / "job-decisions.json"
+    record_decision(
+        state_file, IDS[0], "offered", job=api_job(IDS[0], "Saved role"),
+        now="2026-09-03T08:00:00Z", event_date="2026-09-03",
+    )
+    record_decision(
+        state_file, IDS[0], "applied", job=None,
+        now="2026-09-02T10:00:00Z", event_date="2026-09-02",
+        note="First line\nStatus : forged",
+    )
+    record_decision(
+        state_file, IDS[0], "interviewing", job=None,
+        now="2026-09-02T10:00:00Z", event_date="2026-09-02",
+    )
+    record_decision(
+        state_file, IDS[0], "rejected", job=None,
+        now="2026-09-04T09:00:00Z", event_date="2026-09-04",
+        rejection_reason="Role closed\nUpdated : forged",
+    )
+
+    def unexpected_api_call(*_args, **_kwargs):
+        raise AssertionError("history must not call Pegel")
+
+    monkeypatch.setattr(pegel_query, "fetch", unexpected_api_call)
+    monkeypatch.setattr(pegel_query, "fetch_job", unexpected_api_call)
+    stdout = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--history", IDS[0]],
+        fetch_detail=unexpected_api_call,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert exit_code == 0
+    assert "Status   : rejected" in output
+    assert output.index("Status   : applied") < output.index("Status   : interviewing")
+    assert output.index("Status   : interviewing") < output.index("Status   : offered")
+    assert output.index("Status   : offered") < output.rindex("Status   : rejected")
+    assert "\n             Status : forged" in output
+    assert "\n             Updated : forged" in output
+    assert "\nStatus : forged" not in output
+    assert "\nUpdated : forged" not in output
+
+    json_stdout = StringIO()
+    assert pegel_query.main(
+        ["--state-file", str(state_file), "--history", IDS[0], "--json"],
+        fetch_detail=unexpected_api_call,
+        stdout=json_stdout,
+    ) == 0
+    assert [
+        event["status"] for event in json.loads(json_stdout.getvalue())["data"]["history"]
+    ] == ["applied", "interviewing", "offered", "rejected"]
+
+
+def test_missing_history_returns_one_without_an_api_request(tmp_path, monkeypatch):
+    def unexpected_api_call(*_args, **_kwargs):
+        raise AssertionError("history must not call Pegel")
+
+    monkeypatch.setattr(pegel_query, "fetch", unexpected_api_call)
+    monkeypatch.setattr(pegel_query, "fetch_job", unexpected_api_call)
+    stderr = StringIO()
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(tmp_path / "missing.json"), "--history", IDS[0]],
+        fetch_detail=unexpected_api_call,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert stderr.getvalue() == f"No local history exists for {IDS[0]}.\n"

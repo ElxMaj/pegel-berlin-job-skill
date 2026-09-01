@@ -9,7 +9,7 @@ Usage:
   python3 scripts/pegel_query.py --german not_needed --salary-disclosed --limit 10
   python3 scripts/pegel_query.py --tech-tags react,typescript --seniority senior
   python3 scripts/pegel_query.py --q "platform engineer" --json
-  python3 scripts/pegel_query.py --mark <full-job-id> shortlisted
+  python3 scripts/pegel_query.py --mark-json-stdin
   python3 scripts/pegel_query.py --list-decisions shortlisted
 """
 from __future__ import annotations
@@ -26,15 +26,20 @@ from pathlib import Path
 from typing import Callable
 
 from job_decisions import (
+    DecisionStoreCommittedError,
     DecisionStoreError,
-    VERDICTS,
+    STATUSES,
+    chronological_history,
     decision_path,
     forget_decision,
+    get_decision,
     is_trusted_pegel_url,
     list_decisions,
     load_decisions,
     normalize_job_id,
     record_decision,
+    validate_event_input,
+    validate_job_snapshot,
 )
 
 API = "https://pegel.berlin/api/v1/jobs"
@@ -49,10 +54,55 @@ BLUE_CARD_2026_SHORTAGE = 45_934.20
 # languageTier (response) -> plain English. null is a real answer: "we don't know".
 LANGUAGE = {"none": "No German required", "required": "German required", None: "unknown"}
 VISA = {"sponsors": "Sponsors visas", "does_not_sponsor": "Does not sponsor", None: "unknown"}
+MARK_STDIN_MAX_BYTES = 16 * 1024
+MARK_STDIN_FIELDS = {
+    "jobId",
+    "status",
+    "date",
+    "note",
+    "rejectionReason",
+    "responseKind",
+    "contactName",
+}
 
 
 class PegelApiError(RuntimeError):
     """A read from Pegel's public API failed or returned an invalid shape."""
+
+
+def _read_mark_json_stdin(stdin) -> dict:
+    try:
+        raw_payload = stdin.read(MARK_STDIN_MAX_BYTES + 1)
+    except (OSError, UnicodeError) as error:
+        raise DecisionStoreError("Could not read mark JSON from stdin") from error
+    if not isinstance(raw_payload, str):
+        raise DecisionStoreError("Mark JSON stdin must be text")
+    try:
+        payload_size = len(raw_payload.encode("utf-8"))
+    except UnicodeError as error:
+        raise DecisionStoreError("Mark JSON stdin is not valid UTF-8 text") from error
+    if payload_size > MARK_STDIN_MAX_BYTES:
+        raise DecisionStoreError("Mark JSON stdin is too large")
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise DecisionStoreError("Mark stdin must contain one valid JSON object") from error
+    if not isinstance(payload, dict):
+        raise DecisionStoreError("Mark stdin must contain one JSON object")
+    unknown = set(payload) - MARK_STDIN_FIELDS
+    if unknown:
+        raise DecisionStoreError("Mark JSON has unknown fields")
+    missing = {"jobId", "status"} - set(payload)
+    if missing:
+        raise DecisionStoreError(
+            f"Mark JSON is missing required field: {', '.join(sorted(missing))}"
+        )
+    null_fields = [field for field, value in payload.items() if value is None]
+    if null_fields:
+        raise DecisionStoreError(
+            f"Mark JSON fields may not be null: {', '.join(sorted(null_fields))}"
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -92,6 +142,18 @@ def fetch(params: dict[str, str]) -> dict:
     return payload
 
 
+def _validated_fetched_job(job: object, job_id: str) -> dict | None:
+    if job is None:
+        return None
+    if not isinstance(job, dict) or job.get("id") != job_id:
+        raise PegelApiError("Pegel returned an invalid job response")
+    try:
+        validate_job_snapshot(job)
+    except DecisionStoreError as error:
+        raise PegelApiError("Pegel returned an invalid job snapshot") from error
+    return job
+
+
 def fetch_job(job_id: str) -> dict | None:
     job_id = normalize_job_id(job_id)
     url = f"{API}/{urllib.parse.quote(job_id, safe='')}"
@@ -99,9 +161,7 @@ def fetch_job(job_id: str) -> dict | None:
     if payload is None:
         return None
     job = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(job, dict) or job.get("id") != job_id:
-        raise PegelApiError("Pegel returned an invalid job response")
-    return job
+    return _validated_fetched_job(job, job_id)
 
 
 def collect_jobs(
@@ -196,12 +256,61 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _write_json(payload: dict, stdout) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2), file=stdout)
+
+
+def _status_text(status: str) -> str:
+    if status == "passed":
+        return "passed (you chose not to pursue this role)"
+    return status
+
+
+def _write_text_field(label: str, value: object, stdout, *, indent: str = "  ") -> None:
+    text = str(value)
+    prefix = f"{indent}{label:<9}: "
+    continuation = " " * len(prefix)
+    lines = text.split("\n")
+    print(f"{prefix}{lines[0]}", file=stdout)
+    for line in lines[1:]:
+        print(f"{continuation}{line}", file=stdout)
+
+
+def _write_decision_summary(item: dict, stdout) -> None:
+    _write_text_field("Role", item.get("title") or "Unknown role", stdout)
+    _write_text_field("Company", item.get("company") or "unknown company", stdout)
+    _write_text_field("Status", _status_text(item["status"]), stdout)
+    _write_text_field("Updated", item.get("updatedAt") or "unknown", stdout)
+    _write_text_field("Job ID", item["id"], stdout)
+    if item.get("pegelUrl"):
+        _write_text_field("Read", item["pegelUrl"], stdout)
+
+
+def _write_history(record: dict, stdout) -> None:
+    _write_decision_summary(record, stdout)
+    print("\nTimeline", file=stdout)
+    for event in chronological_history(record["history"]):
+        _write_text_field("Date", event["date"], stdout)
+        _write_text_field("Status", _status_text(event["status"]), stdout)
+        _write_text_field("Recorded", event["recordedAt"], stdout)
+        for field, label in (
+            ("note", "Note"),
+            ("rejectionReason", "Reason"),
+            ("responseKind", "Response"),
+            ("contactName", "Contact"),
+        ):
+            if field in event:
+                _write_text_field(label, event[field], stdout)
+        print(file=stdout)
+
+
 def main(
     argv: list[str] | None = None,
     *,
     fetch_page: Callable[[dict[str, str]], dict] | None = None,
     fetch_detail: Callable[[str], dict | None] | None = None,
     now: Callable[[], str] = utc_now,
+    stdin=sys.stdin,
     stdout=sys.stdout,
     stderr=sys.stderr,
 ) -> int:
@@ -215,19 +324,37 @@ def main(
     decision_actions.add_argument(
         "--mark",
         nargs=2,
-        metavar=("JOB_ID", "VERDICT"),
-        help="save shortlisted, applied or passed for a full job UUID",
+        metavar=("JOB_ID", "STATUS"),
+        help=(
+            "append a status event using direct CLI compatibility inputs; values may be "
+            "visible in child argv and shell history"
+        ),
+    )
+    decision_actions.add_argument(
+        "--mark-json-stdin",
+        action="store_true",
+        help="read one private mark from stdin without putting its values in child argv",
     )
     decision_actions.add_argument(
         "--list-decisions",
-        choices=("all", *VERDICTS),
+        choices=("all", *STATUSES),
         help="list saved decisions locally without an API request",
+    )
+    decision_actions.add_argument(
+        "--history",
+        metavar="JOB_ID",
+        help="show one saved decision timeline without an API request",
     )
     decision_actions.add_argument(
         "--forget",
         metavar="JOB_ID",
         help="delete one decision so the role appears in normal searches again",
     )
+    p.add_argument("--date", help="event date in YYYY-MM-DD format (mark only)")
+    p.add_argument("--note", help="short local note (mark only)")
+    p.add_argument("--reason", help="short rejection reason (rejected mark only)")
+    p.add_argument("--response-kind", help="human, automated or unknown (mark only)")
+    p.add_argument("--contact-name", help="contact name (mark only)")
     p.add_argument("--german", choices=["not_needed", "needed", "unknown"])
     p.add_argument("--visa", action="store_true", help="Company-level sponsorship signal")
     p.add_argument("--salary-disclosed", action="store_true")
@@ -242,63 +369,155 @@ def main(
     p.add_argument(
         "--include-decided",
         action="store_true",
-        help="include roles already marked shortlisted, applied or passed",
+        help="include roles with any saved status",
     )
     p.add_argument("--json", action="store_true", help="locally filtered JSON")
     a = p.parse_args(argv)
 
     state_file = decision_path(a.state_file)
-    if a.mark:
-        job_id, verdict = a.mark
-        if verdict not in VERDICTS:
-            print(f"Decision error: Verdict must be one of: {', '.join(VERDICTS)}", file=stderr)
-            return 2
+    metadata = (a.date, a.note, a.reason, a.response_kind, a.contact_name)
+    if a.mark_json_stdin and any(value is not None for value in metadata):
+        print(
+            "Decision error: --mark-json-stdin conflicts with legacy metadata flags",
+            file=stderr,
+        )
+        return 2
+    if any(value is not None for value in metadata) and not a.mark:
+        print("Decision error: Event metadata may only be used with --mark", file=stderr)
+        return 2
+    if a.mark or a.mark_json_stdin:
         try:
+            if a.mark_json_stdin:
+                mark = _read_mark_json_stdin(stdin)
+                job_id = mark["jobId"]
+                status = mark["status"]
+                event_date = mark.get("date")
+                note = mark.get("note")
+                reason = mark.get("rejectionReason")
+                response_kind = mark.get("responseKind")
+                contact_name = mark.get("contactName")
+            else:
+                job_id, status = a.mark
+                event_date = a.date
+                note = a.note
+                reason = a.reason
+                response_kind = a.response_kind
+                contact_name = a.contact_name
             job_id = normalize_job_id(job_id)
+            recorded_at = now()
+            event = validate_event_input(
+                status,
+                recorded_at,
+                event_date,
+                note,
+                reason,
+                response_kind,
+                contact_name,
+            )
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
             return 2
         try:
-            job = (fetch_detail or fetch_job)(job_id)
+            job = _validated_fetched_job((fetch_detail or fetch_job)(job_id), job_id)
         except PegelApiError as error:
             job = None
             print(f"Warning: {error}; saved without a job snapshot.", file=stderr)
         try:
-            record_decision(state_file, job_id, verdict, job=job, now=now())
+            record = record_decision(
+                state_file,
+                job_id,
+                status,
+                job=job,
+                now=recorded_at,
+                event_date=event["date"],
+                note=note,
+                rejection_reason=reason,
+                response_kind=response_kind,
+                contact_name=contact_name,
+            )
+        except DecisionStoreCommittedError as error:
+            record = error.committed_result
+            print(
+                "Warning: Change was saved, but decision-lock cleanup failed. "
+                "Inspect local history before attempting another update.",
+                file=stderr,
+            )
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
             return 2
-        print(f"Marked {job_id} as {verdict}. Saved locally in {state_file}", file=stdout)
+        if a.json:
+            _write_json({"data": record}, stdout)
+        else:
+            print(f"Marked {job_id} as {_status_text(status)}. Saved locally in {state_file}", file=stdout)
         return 0
     if a.list_decisions:
-        verdict = None if a.list_decisions == "all" else a.list_decisions
+        status = None if a.list_decisions == "all" else a.list_decisions
         try:
-            saved = list_decisions(state_file, verdict)
+            saved = list_decisions(state_file, status)
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
             return 1
         label = a.list_decisions
+        if a.json:
+            _write_json(
+                {
+                    "data": saved,
+                    "selection": {"status": label, "returned": len(saved)},
+                },
+                stdout,
+            )
+            return 0
         noun = "role" if len(saved) == 1 else "roles"
         print(f"{len(saved)} {label} {noun}\n", file=stdout)
         for item in saved:
-            print(f"{item.get('title') or 'Unknown role'} — {item.get('company') or 'unknown company'}", file=stdout)
-            print(f"  Verdict : {item['verdict']}", file=stdout)
-            print(f"  Updated : {item.get('updatedAt') or 'unknown'}", file=stdout)
-            print(f"  Job ID  : {item['id']}", file=stdout)
-            if item.get("pegelUrl"):
-                print(f"  Read     : {item['pegelUrl']}", file=stdout)
+            _write_decision_summary(item, stdout)
             print(file=stdout)
         return 0
-    if a.forget:
+    if a.history:
         try:
-            removed = forget_decision(state_file, a.forget)
+            job_id = normalize_job_id(a.history)
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 2
+        try:
+            record = get_decision(state_file, job_id)
         except DecisionStoreError as error:
             print(f"Decision error: {error}", file=stderr)
             return 1
-        if removed:
-            print(f"Forgot {a.forget}. It will appear in normal searches again.", file=stdout)
+        if record is None:
+            print(f"No local history exists for {job_id}.", file=stderr)
+            return 1
+        record["history"] = chronological_history(record["history"])
+        if a.json:
+            _write_json({"data": record}, stdout)
         else:
-            print(f"No local decision exists for {a.forget}.", file=stdout)
+            _write_history(record, stdout)
+        return 0
+    if a.forget:
+        try:
+            job_id = normalize_job_id(a.forget)
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 2
+        try:
+            removed = forget_decision(state_file, job_id)
+        except DecisionStoreCommittedError as error:
+            removed = error.committed_result
+            print(
+                "Warning: Change was saved, but decision-lock cleanup failed. "
+                "Inspect local history before attempting another update.",
+                file=stderr,
+            )
+        except DecisionStoreError as error:
+            print(f"Decision error: {error}", file=stderr)
+            return 1
+        if a.json:
+            _write_json({"data": {"id": job_id, "forgotten": removed}}, stdout)
+            return 0
+        if removed:
+            print(f"Forgot {job_id}. It will appear in normal searches again.", file=stdout)
+        else:
+            print(f"No local decision exists for {job_id}.", file=stdout)
         return 0
 
     limit = min(max(a.limit, 1), 100)
@@ -331,27 +550,24 @@ def main(
     jobs = result.jobs
 
     if a.json:
-        print(
-            json.dumps(
-                {
-                    "data": jobs,
-                    "pagination": {
-                        "page": 1,
-                        "pageSize": limit,
-                        "totalCount": result.api_total_count,
-                        "totalPages": (result.api_total_count + limit - 1) // limit,
-                    },
-                    "selection": {
-                        "returned": len(jobs),
-                        "apiMatches": result.api_total_count,
-                        "scanned": result.scanned,
-                        "decidedExcluded": result.decided_excluded,
-                        "decidedFiltering": not a.include_decided,
-                    },
+        _write_json(
+            {
+                "data": jobs,
+                "pagination": {
+                    "page": 1,
+                    "pageSize": limit,
+                    "totalCount": result.api_total_count,
+                    "totalPages": (result.api_total_count + limit - 1) // limit,
                 },
-                indent=2,
-            ),
-            file=stdout,
+                "selection": {
+                    "returned": len(jobs),
+                    "apiMatches": result.api_total_count,
+                    "scanned": result.scanned,
+                    "decidedExcluded": result.decided_excluded,
+                    "decidedFiltering": not a.include_decided,
+                },
+            },
+            stdout,
         )
         return 0
 

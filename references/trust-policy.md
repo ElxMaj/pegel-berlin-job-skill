@@ -45,19 +45,30 @@ Under GDPR a CV is personal data; the cleanest way to honour that is to never re
 If the environment cannot read a local file, the skill says so and stops. It will never suggest a
 cloud upload as a workaround.
 
-## It will never upload job decisions
+## It will never upload application history
 
-`shortlisted`, `applied` and `passed` verdicts stay in the candidate's local decision file. Normal
-searches read that file after the public API responds, then remove judged job IDs on the candidate's
-machine. Pegel never receives the verdict in a URL, request body or header.
+All eight statuses, `shortlisted`, `applied`, `interviewing`, `offered`, `accepted`, `rejected`,
+`withdrawn`, and `passed`, stay in the candidate's local decision file. So do event dates, notes,
+rejection reasons, response kinds, and contact names. Normal searches read that file after the
+public API responds, then remove logged job IDs on the candidate's machine. Pegel never receives
+the status or event metadata in a URL, request body, or header.
 
-Marking a role may make one ordinary read-only request for that public job ID so the local file can
-keep its title and Pegel link. If the request fails, the skill records the verdict without the
-snapshot. Listing saved decisions never calls the API.
+Listing statuses and reading one role's history are offline. Marking a role may make one ordinary
+read-only request for that public job UUID so the local file can keep its title and Pegel link. The
+request contains only the UUID. If it fails, the skill records the event without the snapshot.
 
-The skill records a verdict only after an explicit candidate decision. Preparing or tailoring an
-application does not mean `applied`. `passed` means the candidate chose not to pursue the role; it
-does not describe an interview result.
+The skill records only candidate-explicit facts. Preparing or tailoring an application does not
+mean `applied`. Silence does not mean `rejected`, and an ambiguous outcome needs confirmation.
+`passed` means the candidate chose not to pursue the role; it does not describe an interview
+result.
+
+A local note or rejection reason is a candidate-approved short summary. A rejection reason is
+never inferred from Pegel, the job description, silence, or correspondence. A response kind and
+contact name may also be stored locally when explicitly supplied or approved. Raw message bodies,
+email addresses, attachments, and mailbox identifiers are never stored.
+
+`--forget` removes a role only from the active log. An existing `.v1.bak` migration backup remains
+sensitive recovery data and is never automatically rewritten or deleted.
 
 ## It will never keyword-stuff
 
