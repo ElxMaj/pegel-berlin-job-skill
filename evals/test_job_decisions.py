@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -35,11 +36,19 @@ def record(decisions, path, job_id=JOB_ID, status="shortlisted", **kwargs):
     return decisions.record_decision(path, job_id, status, **defaults)
 
 
+def windows_link_creation_is_unavailable(error):
+    if os.name != "nt":
+        return False
+    if isinstance(error, NotImplementedError):
+        return True
+    return getattr(error, "winerror", None) in {1, 50, 1314}
+
+
 def create_symlink_if_supported(target, link):
     try:
         link.symlink_to(target)
-    except (OSError, NotImplementedError):
-        if os.name != "nt":
+    except (OSError, NotImplementedError) as error:
+        if not windows_link_creation_is_unavailable(error):
             raise
         return False
     return True
@@ -48,11 +57,114 @@ def create_symlink_if_supported(target, link):
 def create_hard_link_if_supported(source, link):
     try:
         os.link(source, link)
-    except (OSError, NotImplementedError):
-        if os.name != "nt":
+    except (OSError, NotImplementedError) as error:
+        if not windows_link_creation_is_unavailable(error):
             raise
         return False
     return True
+
+
+@contextmanager
+def symlink_or_mocked_lstat(monkeypatch, target, link, *, force_mocked_fallback):
+    native_link = False
+    if not force_mocked_fallback:
+        native_link = create_symlink_if_supported(target, link)
+    if native_link:
+        yield True
+        return
+
+    link.write_bytes(b"mocked symlink")
+    real_lstat = Path.lstat
+    link_stat = real_lstat(link)
+    stat_values = list(link_stat)
+    stat_values[0] = stat.S_IFLNK | 0o777
+    mocked_link_stat = os.stat_result(stat_values)
+    inspected = 0
+
+    def mocked_lstat(path):
+        nonlocal inspected
+        if Path(path) == link:
+            inspected += 1
+            return mocked_link_stat
+        return real_lstat(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "lstat", mocked_lstat)
+        yield False
+    assert inspected > 0, "mocked symlink did not reach the production lstat guard"
+
+
+@contextmanager
+def hard_link_or_mocked_fstat(
+    monkeypatch, decisions, source, link, inspected_path, *, force_mocked_fallback
+):
+    native_link = False
+    if not force_mocked_fallback:
+        native_link = create_hard_link_if_supported(source, link)
+    if native_link:
+        yield True
+        return
+
+    if inspected_path == link:
+        link.write_bytes(source.read_bytes())
+    elif inspected_path != source:
+        raise AssertionError("mocked hard-link inspection path must be one link endpoint")
+
+    real_open = os.open
+    real_fstat = os.fstat
+    inspected_fds = set()
+    inspected = 0
+
+    def tracked_open(path, *args):
+        fd = real_open(path, *args)
+        if Path(path) == inspected_path:
+            inspected_fds.add(fd)
+        return fd
+
+    def mocked_fstat(fd):
+        nonlocal inspected
+        result = real_fstat(fd)
+        if fd not in inspected_fds:
+            return result
+        inspected += 1
+        stat_values = list(result)
+        stat_values[3] = 2
+        return os.stat_result(stat_values)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(decisions.os, "open", tracked_open)
+        patch.setattr(decisions.os, "fstat", mocked_fstat)
+        yield False
+    assert inspected > 0, "mocked hard link did not reach the production fstat guard"
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hard-link"])
+def test_link_setup_helpers_do_not_swallow_unexpected_windows_errors(
+    tmp_path, monkeypatch, link_kind
+):
+    source = tmp_path / "source"
+    link = tmp_path / "link"
+    source.write_bytes(b"source")
+    unexpected = OSError("unexpected setup failure")
+    unexpected.winerror = 123
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        if link_kind == "symlink":
+            def raise_unexpected(*_args, **_kwargs):
+                raise unexpected
+
+            patch.setattr(Path, "symlink_to", raise_unexpected)
+            operation = lambda: create_symlink_if_supported(source, link)
+        else:
+            def raise_unexpected(*_args, **_kwargs):
+                raise unexpected
+
+            patch.setattr(os, "link", raise_unexpected)
+            operation = lambda: create_hard_link_if_supported(source, link)
+
+        with pytest.raises(OSError, match="unexpected setup failure"):
+            operation()
 
 
 def v2_record(*, status="shortlisted", date="2026-09-01", recorded_at="2026-09-01T08:30:00Z"):
@@ -276,25 +388,32 @@ def test_v1_mutation_accepts_an_identical_existing_backup(tmp_path):
     assert decisions.get_decision(state_file, JOB_ID)["status"] == "shortlisted"
 
 
-def test_v1_mutation_rejects_a_backup_symlink_to_the_source_without_changes(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_v1_mutation_rejects_a_backup_symlink_to_the_source_without_changes(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     backup_file = Path(f"{state_file}.v1.bak")
     original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
     state_file.write_bytes(original)
-    if not create_symlink_if_supported(state_file, backup_file):
-        assert state_file.read_bytes() == original
-        assert not os.path.lexists(backup_file)
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="backup"):
-        record(decisions, state_file)
+    with symlink_or_mocked_lstat(
+        monkeypatch,
+        state_file,
+        backup_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
-    assert backup_file.is_symlink()
+    assert backup_file.is_symlink() is native_link
 
 
-def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     backup_file = Path(f"{state_file}.v1.bak")
@@ -302,19 +421,25 @@ def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(tm
     state_file.write_bytes(original)
     if os.name != "nt":
         state_file.chmod(0o600)
-    if not create_hard_link_if_supported(state_file, backup_file):
-        assert state_file.read_bytes() == original
-        assert not backup_file.exists()
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="backup"):
-        record(decisions, state_file)
+    with hard_link_or_mocked_fstat(
+        monkeypatch,
+        decisions,
+        state_file,
+        backup_file,
+        backup_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
-    assert os.path.samefile(state_file, backup_file)
+    assert os.path.samefile(state_file, backup_file) is native_link
 
 
-def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     backup_file = Path(f"{state_file}.v1.bak")
@@ -324,17 +449,22 @@ def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(tmp_path)
     backup_file.write_bytes(original)
     if os.name != "nt":
         backup_file.chmod(0o600)
-    if not create_hard_link_if_supported(backup_file, backup_alias):
-        assert state_file.read_bytes() == original
-        assert backup_file.read_bytes() == original
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="backup"):
-        record(decisions, state_file)
+    with hard_link_or_mocked_fstat(
+        monkeypatch,
+        decisions,
+        backup_file,
+        backup_alias,
+        backup_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
     assert backup_file.read_bytes() == original
-    assert os.path.samefile(backup_file, backup_alias)
+    assert backup_alias.exists() is native_link
+    if native_link:
+        assert os.path.samefile(backup_file, backup_alias)
 
 
 def test_v1_existing_backup_mode_contract_is_platform_specific(tmp_path):
@@ -412,43 +542,56 @@ def test_mutation_reports_lock_contention_without_changing_source(tmp_path):
     assert state_file.read_bytes() == original
 
 
-def test_mutation_rejects_a_lock_symlink_to_the_source_without_changes(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_mutation_rejects_a_lock_symlink_to_the_source_without_changes(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     lock_file = Path(f"{state_file}.lock")
     original = b'{"version": 2, "jobs": {}}\n'
     state_file.write_bytes(original)
-    if not create_symlink_if_supported(state_file, lock_file):
-        assert state_file.read_bytes() == original
-        assert not os.path.lexists(lock_file)
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="lock"):
-        record(decisions, state_file)
+    with symlink_or_mocked_lstat(
+        monkeypatch,
+        state_file,
+        lock_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
-    assert lock_file.is_symlink()
+    assert lock_file.is_symlink() is native_link
 
 
-def test_mutation_rejects_a_lock_hard_link_to_the_source_without_changes(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_mutation_rejects_a_lock_hard_link_to_the_source_without_changes(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     lock_file = Path(f"{state_file}.lock")
     original = b'{"version": 2, "jobs": {}}\n'
     state_file.write_bytes(original)
-    if not create_hard_link_if_supported(state_file, lock_file):
-        assert state_file.read_bytes() == original
-        assert not lock_file.exists()
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="lock"):
-        record(decisions, state_file)
+    with hard_link_or_mocked_fstat(
+        monkeypatch,
+        decisions,
+        state_file,
+        lock_file,
+        lock_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
-    assert os.path.samefile(state_file, lock_file)
+    assert os.path.samefile(state_file, lock_file) is native_link
 
 
-def test_mutation_rejects_a_lock_hard_link_to_another_file_without_writing_it(tmp_path):
+@pytest.mark.parametrize("force_mocked_fallback", [False, True])
+def test_mutation_rejects_a_lock_hard_link_to_another_file_without_writing_it(
+    tmp_path, monkeypatch, force_mocked_fallback
+):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     lock_file = Path(f"{state_file}.lock")
@@ -456,17 +599,20 @@ def test_mutation_rejects_a_lock_hard_link_to_another_file_without_writing_it(tm
     original = b'{"version": 2, "jobs": {}}\n'
     state_file.write_bytes(original)
     other_file.write_bytes(b"")
-    if not create_hard_link_if_supported(other_file, lock_file):
-        assert state_file.read_bytes() == original
-        assert other_file.read_bytes() == b""
-        return
-
-    with pytest.raises(decisions.DecisionStoreError, match="lock"):
-        record(decisions, state_file)
+    with hard_link_or_mocked_fstat(
+        monkeypatch,
+        decisions,
+        other_file,
+        lock_file,
+        lock_file,
+        force_mocked_fallback=force_mocked_fallback,
+    ) as native_link:
+        with pytest.raises(decisions.DecisionStoreError, match="lock"):
+            record(decisions, state_file)
 
     assert state_file.read_bytes() == original
     assert other_file.read_bytes() == b""
-    assert os.path.samefile(other_file, lock_file)
+    assert os.path.samefile(other_file, lock_file) is native_link
 
 
 def test_mutation_rejects_a_non_regular_lock_without_changes(tmp_path):
