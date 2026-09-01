@@ -45,6 +45,20 @@ Under GDPR a CV is personal data; the cleanest way to honour that is to never re
 If the environment cannot read a local file, the skill says so and stops. It will never suggest a
 cloud upload as a workaround.
 
+## It will never upload job decisions
+
+`shortlisted`, `applied` and `passed` verdicts stay in the candidate's local decision file. Normal
+searches read that file after the public API responds, then remove judged job IDs on the candidate's
+machine. Pegel never receives the verdict in a URL, request body or header.
+
+Marking a role may make one ordinary read-only request for that public job ID so the local file can
+keep its title and Pegel link. If the request fails, the skill records the verdict without the
+snapshot. Listing saved decisions never calls the API.
+
+The skill records a verdict only after an explicit candidate decision. Preparing or tailoring an
+application does not mean `applied`. `passed` means the candidate chose not to pursue the role; it
+does not describe an interview result.
+
 ## It will never keyword-stuff
 
 It will point out where the employer's terminology differs from the candidate's, and use the
@@ -60,6 +74,6 @@ Ausländerbehörde, or the official portals.
 
 ---
 
-**What it does instead:** find live Berlin roles, explain what each actually requires, show you
-what is unknown, assess your fit honestly, help you write truthful materials locally, and prepare
-you, so that when you do apply, you apply well.
+**What it does instead:** it finds live Berlin roles and explains what is known. It remembers your
+explicit decisions locally. It helps you prepare a truthful application, so that when you do apply,
+you apply well.

@@ -6,6 +6,50 @@ Never scrape an ATS, never invent a listing, never use a cached list you cannot 
 Base: `https://pegel.berlin/api/v1`
 Rate limit: **60 requests/minute per IP**. Respect it. Batch your thinking, not your requests.
 
+## Local selection layer
+
+`scripts/pegel_query.py` is not a transparent one-page API client. It applies the candidate's
+private decision file after each read:
+
+1. Request up to 100 API roles at a time in the API's existing order.
+2. Remove IDs already marked `shortlisted`, `applied` or `passed` unless `--include-decided` was
+   explicitly requested.
+3. Continue to the next API page until the requested `--limit` of unseen roles is filled or the
+   API result set is exhausted.
+
+This filter runs for both text and `--json` output. Filtered JSON has this shape:
+
+```json
+{
+  "data": [],
+  "pagination": {
+    "page": 1,
+    "pageSize": 10,
+    "totalCount": 0,
+    "totalPages": 0
+  },
+  "selection": {
+    "returned": 0,
+    "apiMatches": 0,
+    "scanned": 0,
+    "decidedExcluded": 0,
+    "decidedFiltering": true
+  }
+}
+```
+
+`pagination` keeps the original `--json` response fields for existing consumers. It describes the
+API matches before local decision filtering, using the requested `--limit` as its page size.
+`selection` describes what the local filtering step actually scanned, removed and returned.
+`apiMatches` is the API's total before local filtering. `decidedExcluded` counts judged roles
+encountered while filling this result, not every judged role across all pages. Do not describe it
+as the candidate's total decision count. Use `--list-decisions all` for that.
+
+The verdict file is local. The list endpoint never receives its contents. `--mark` reads the
+single public job endpoint to save a display snapshot, but sends only the public job ID. If the
+read fails, it saves the verdict without the snapshot. See `python3 scripts/pegel_query.py --help`
+for commands.
+
 ## `GET /jobs`
 
 Returns currently-active Berlin startup roles.
