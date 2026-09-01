@@ -138,14 +138,7 @@ def _validate_event(event: object, job_id: str) -> dict:
 
 
 def _current_event(history: list[dict]) -> dict:
-    return max(
-        enumerate(history),
-        key=lambda item: (
-            _parse_event_date(item[1]["date"]),
-            _parse_utc_timestamp(item[1]["recordedAt"], "recordedAt"),
-            item[0],
-        ),
-    )[1]
+    return chronological_history(history)[-1]
 
 
 def _normalize_v1(store: object) -> dict:
@@ -382,7 +375,7 @@ def _atomic_write(path: Path, store: dict) -> None:
             ) from cleanup_error
 
 
-def _event_input(
+def validate_event_input(
     status: str,
     now: object,
     event_date: object | None,
@@ -452,7 +445,7 @@ def record_decision(
     contact_name: str | None = None,
 ) -> dict:
     job_id = normalize_job_id(job_id)
-    event = _event_input(
+    event = validate_event_input(
         status,
         now,
         event_date,
@@ -487,11 +480,26 @@ def get_decision(path: Path, job_id: str) -> dict | None:
     return {"id": job_id, **copy.deepcopy(record)}
 
 
+def chronological_history(history: list[dict]) -> list[dict]:
+    """Return events in parsed date/time order, preserving append ties."""
+    return [
+        copy.deepcopy(event)
+        for _, event in sorted(
+            enumerate(history),
+            key=lambda item: (
+                _parse_event_date(item[1]["date"]),
+                _parse_utc_timestamp(item[1]["recordedAt"], "recordedAt"),
+                item[0],
+            ),
+        )
+    ]
+
+
 def list_decisions(path: Path, status: str | None = None) -> list[dict]:
     if status is not None and status not in STATUSES:
         raise DecisionStoreError(f"Status must be one of: {', '.join(STATUSES)}")
     selected = [
-        {"id": job_id, **copy.deepcopy(record), "verdict": record["status"]}
+        {"id": job_id, **copy.deepcopy(record)}
         for job_id, record in load_decisions(path)["jobs"].items()
         if status is None or record["status"] == status
     ]
