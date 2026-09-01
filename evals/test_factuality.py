@@ -7,6 +7,7 @@ must not ship.
 
 Run:  python3 -m pytest evals/ -q
 """
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from pegel_query import blue_card, salary_text  # noqa: E402
+
+
+SKILL_TEXT = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+SKILL_TEXT_LOWER = " ".join(SKILL_TEXT.lower().split())
 
 
 def job(**over):
@@ -99,3 +104,35 @@ def test_language_and_visa_nulls_map_to_unknown_not_to_no():
     assert LANGUAGE[None] == "unknown"
     assert VISA[None] == "unknown"
     assert VISA["does_not_sponsor"] != VISA[None]
+
+
+# --- Application history stays honest and private -------------------------
+
+def test_skill_teaches_the_complete_application_status_vocabulary():
+    required = {
+        "shortlisted", "applied", "interviewing", "offered",
+        "accepted", "rejected", "withdrawn", "passed",
+    }
+    documented = set(re.findall(r"`([a-z]+)`", SKILL_TEXT))
+    assert required <= documented
+
+
+def test_skill_defines_passed_as_non_pursuit_not_interview_success():
+    assert "`passed` means the candidate explicitly chose not to pursue a role" in SKILL_TEXT
+    assert "never means they passed an interview stage" in SKILL_TEXT_LOWER
+
+
+def test_skill_requires_confirmation_instead_of_inferring_an_outcome():
+    assert "record only a candidate-explicit fact" in SKILL_TEXT_LOWER
+    assert "silence is not a rejection" in SKILL_TEXT_LOWER
+    assert "ask for confirmation" in SKILL_TEXT_LOWER
+
+
+def test_skill_forbids_raw_correspondence_and_mailbox_identifiers():
+    assert "never store a raw message" in SKILL_TEXT_LOWER
+    for forbidden_item in ("raw message", "email address", "attachment", "mailbox identifier"):
+        assert forbidden_item in SKILL_TEXT_LOWER
+
+
+def test_skill_keeps_status_and_event_metadata_off_pegel():
+    assert "status and metadata never leave the machine" in SKILL_TEXT_LOWER

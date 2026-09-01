@@ -12,8 +12,7 @@ Rate limit: **60 requests/minute per IP**. Respect it. Batch your thinking, not 
 private decision file after each read:
 
 1. Request up to 100 API roles at a time in the API's existing order.
-2. Remove IDs already marked `shortlisted`, `applied` or `passed` unless `--include-decided` was
-   explicitly requested.
+2. Remove IDs with any saved local status unless `--include-decided` was explicitly requested.
 3. Continue to the next API page until the requested `--limit` of unseen roles is filled or the
    API result set is exhausted.
 
@@ -45,10 +44,16 @@ API matches before local decision filtering, using the requested `--limit` as it
 encountered while filling this result, not every judged role across all pages. Do not describe it
 as the candidate's total decision count. Use `--list-decisions all` for that.
 
-The verdict file is local. The list endpoint never receives its contents. `--mark` reads the
-single public job endpoint to save a display snapshot, but sends only the public job ID. If the
-read fails, it saves the verdict without the snapshot. See `python3 scripts/pegel_query.py --help`
-for commands.
+The application-history file is local. The list endpoint never receives its contents.
+`--list-decisions` and `--history` make no API request. `--mark` may read the single public
+`GET /jobs/<uuid>` endpoint to save a display snapshot, but sends only the public job UUID. If the
+read fails, it saves the event without the snapshot.
+
+The `--date`, `--note`, `--reason`, `--response-kind`, and `--contact-name` flags are local CLI
+inputs. They are not Pegel API parameters and are never copied into a URL, request body, or header.
+Neither status nor event metadata leaves the candidate's machine. See
+`python3 scripts/pegel_query.py --help` for commands and [the trust policy](trust-policy.md) for the
+privacy rules.
 
 ## `GET /jobs`
 
