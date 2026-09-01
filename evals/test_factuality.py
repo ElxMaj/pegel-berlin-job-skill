@@ -162,8 +162,10 @@ def test_skill_forbids_raw_correspondence_and_mailbox_identifiers():
         assert forbidden_item in SKILL_TEXT_LOWER
 
 
-def test_skill_keeps_status_and_event_metadata_off_pegel():
-    assert "status and metadata never leave the machine" in SKILL_TEXT_LOWER
+def test_skill_states_the_pegel_boundary_without_overclaiming_host_privacy():
+    assert "status and metadata are never sent to pegel" in SKILL_TEXT_LOWER
+    assert "host transcript or output capture" in SKILL_TEXT_LOWER
+    assert "status and metadata never leave the machine" not in SKILL_TEXT_LOWER
 
 
 def test_skill_uses_only_structural_stdin_for_agent_private_marks():

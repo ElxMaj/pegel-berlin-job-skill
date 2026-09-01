@@ -40,6 +40,7 @@ _EVENT_FIELDS = {
     "responseKind",
     "contactName",
 }
+_STORE_FIELDS = {"version", "jobs"}
 _RECORD_FIELDS = {"status", "updatedAt", "history", "title", "company", "pegelUrl"}
 
 
@@ -204,6 +205,8 @@ def _normalize_v1(store: object) -> dict:
 def _validate_v2(store: object) -> dict:
     if not isinstance(store, dict) or type(store.get("version")) is not int or store["version"] != SCHEMA_VERSION:
         raise DecisionStoreError("Decision file has an unsupported schema version")
+    if set(store) - _STORE_FIELDS:
+        raise DecisionStoreError("Decision file has invalid root fields")
     jobs = store.get("jobs")
     if not isinstance(jobs, dict):
         raise DecisionStoreError("Decision file jobs must be an object")
@@ -259,6 +262,52 @@ def _read_store(path: Path) -> tuple[dict, int | None, bytes]:
     return _validate_v2(store), store["version"], source_bytes
 
 
+def _open_store_lock(path: Path, lock_path: Path) -> int:
+    fd = None
+    try:
+        try:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(lock_path, flags, 0o600)
+        except FileExistsError:
+            lock_lstat = lock_path.lstat()
+            if not stat.S_ISREG(lock_lstat.st_mode):
+                raise DecisionStoreError(f"Decision lock is not a regular file: {lock_path}")
+            flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(lock_path, flags)
+
+        lock_lstat = lock_path.lstat()
+        lock_fstat = os.fstat(fd)
+        if not stat.S_ISREG(lock_fstat.st_mode) or not os.path.samestat(
+            lock_lstat, lock_fstat
+        ):
+            raise DecisionStoreError(f"Decision lock changed while opening: {lock_path}")
+        if lock_fstat.st_nlink != 1:
+            raise DecisionStoreError(f"Decision lock is not independent: {lock_path}")
+        try:
+            source_stat = path.stat()
+        except FileNotFoundError:
+            source_stat = None
+        if source_stat is not None and os.path.samestat(source_stat, lock_fstat):
+            raise DecisionStoreError(f"Decision lock is not independent: {lock_path}")
+        return fd
+    except DecisionStoreError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    except OSError as error:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise DecisionStoreError(f"Could not open decision lock: {lock_path}") from error
+
+
 @contextmanager
 def _store_lock(path: Path):
     path = Path(path)
@@ -272,7 +321,9 @@ def _store_lock(path: Path):
             pass
         if parent_created:
             os.chmod(path.parent, 0o700)
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = _open_store_lock(path, lock_path)
+    except DecisionStoreError:
+        raise
     except OSError as error:
         raise DecisionStoreError(f"Could not open decision lock: {lock_path}") from error
 
@@ -504,6 +555,11 @@ def _snapshot_from_job(job: object, existing: dict) -> dict:
             raise DecisionStoreError("Decision file has an invalid pegelUrl")
         snapshot["pegelUrl"] = job["pegelUrl"]
     return snapshot
+
+
+def validate_job_snapshot(job: object) -> None:
+    """Validate fields copied from a public detail response into the local store."""
+    _snapshot_from_job(job, {})
 
 
 def record_decision(

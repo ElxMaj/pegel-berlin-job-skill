@@ -230,20 +230,24 @@ the script creates `<decision-file>.v1.bak` with the exact original v1 bytes bef
 an identical backup already exists, it is reused only when it is an independent private regular
 file. Symlinks, non-regular entries, the same underlying file or a hard link, and group- or
 other-accessible POSIX files are rejected without changing either file. Invalid or newer schemas
-fail without being overwritten.
+fail without being overwritten. Schema v2 also rejects unknown root fields instead of silently
+dropping them during a later mutation.
 
 The `.v1.bak` file remains sensitive recovery data. It is never automatically rewritten or deleted,
 including by `--forget`, which removes data only from the active log.
 
 Mutations take an exclusive local lock; a concurrent mutation fails loudly with a retry message.
+An existing lock is reused only when `lstat`, a no-follow open where available, and `fstat` confirm
+it is the same independent regular file with one link. Symlinks, hard links, non-regular entries,
+and replacement races are rejected before locking or writing a Windows lock byte.
 Writes use a same-directory temporary file, flush it, then atomically replace the decision file.
 On systems that support POSIX modes, newly created data directories use `0700` and local files use
 `0600`. No POSIX permission promise is made on Windows.
 
 Listing and history are offline. Marking may make one ordinary read-only request for the public job
 UUID to save its title and link. The status and all event metadata remain local and are never API
-parameters, request bodies, or headers sent to Pegel. If the snapshot read fails, the event is still
-saved without a snapshot.
+parameters, request bodies, or headers sent to Pegel. If the snapshot read fails or returns malformed
+optional snapshot fields, the event is still saved without a snapshot.
 
 ## Data
 

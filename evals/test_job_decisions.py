@@ -35,6 +35,26 @@ def record(decisions, path, job_id=JOB_ID, status="shortlisted", **kwargs):
     return decisions.record_decision(path, job_id, status, **defaults)
 
 
+def create_symlink_if_supported(target, link):
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        if os.name != "nt":
+            raise
+        return False
+    return True
+
+
+def create_hard_link_if_supported(source, link):
+    try:
+        os.link(source, link)
+    except (OSError, NotImplementedError):
+        if os.name != "nt":
+            raise
+        return False
+    return True
+
+
 def v2_record(*, status="shortlisted", date="2026-09-01", recorded_at="2026-09-01T08:30:00Z"):
     return {
         "status": status,
@@ -262,10 +282,10 @@ def test_v1_mutation_rejects_a_backup_symlink_to_the_source_without_changes(tmp_
     backup_file = Path(f"{state_file}.v1.bak")
     original = json.dumps({"version": 1, "jobs": {}}).encode("utf-8")
     state_file.write_bytes(original)
-    try:
-        backup_file.symlink_to(state_file)
-    except OSError as error:
-        pytest.skip(f"symlinks are unavailable: {error}")
+    if not create_symlink_if_supported(state_file, backup_file):
+        assert state_file.read_bytes() == original
+        assert not os.path.lexists(backup_file)
+        return
 
     with pytest.raises(decisions.DecisionStoreError, match="backup"):
         record(decisions, state_file)
@@ -282,10 +302,10 @@ def test_v1_mutation_rejects_a_backup_hard_link_to_the_source_without_changes(tm
     state_file.write_bytes(original)
     if os.name != "nt":
         state_file.chmod(0o600)
-    try:
-        os.link(state_file, backup_file)
-    except OSError as error:
-        pytest.skip(f"hard links are unavailable: {error}")
+    if not create_hard_link_if_supported(state_file, backup_file):
+        assert state_file.read_bytes() == original
+        assert not backup_file.exists()
+        return
 
     with pytest.raises(decisions.DecisionStoreError, match="backup"):
         record(decisions, state_file)
@@ -304,10 +324,10 @@ def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(tmp_path)
     backup_file.write_bytes(original)
     if os.name != "nt":
         backup_file.chmod(0o600)
-    try:
-        os.link(backup_file, backup_alias)
-    except OSError as error:
-        pytest.skip(f"hard links are unavailable: {error}")
+    if not create_hard_link_if_supported(backup_file, backup_alias):
+        assert state_file.read_bytes() == original
+        assert backup_file.read_bytes() == original
+        return
 
     with pytest.raises(decisions.DecisionStoreError, match="backup"):
         record(decisions, state_file)
@@ -317,8 +337,7 @@ def test_v1_mutation_rejects_an_existing_backup_with_another_hard_link(tmp_path)
     assert os.path.samefile(backup_file, backup_alias)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not authoritative on Windows")
-def test_v1_mutation_rejects_a_group_or_other_accessible_existing_backup(tmp_path):
+def test_v1_existing_backup_mode_contract_is_platform_specific(tmp_path):
     decisions = decisions_module()
     state_file = tmp_path / "job-decisions.json"
     backup_file = Path(f"{state_file}.v1.bak")
@@ -327,12 +346,16 @@ def test_v1_mutation_rejects_a_group_or_other_accessible_existing_backup(tmp_pat
     backup_file.write_bytes(original)
     backup_file.chmod(0o644)
 
-    with pytest.raises(decisions.DecisionStoreError, match="backup"):
+    if os.name == "nt":
         record(decisions, state_file)
-
-    assert state_file.read_bytes() == original
+        assert decisions.get_decision(state_file, JOB_ID)["status"] == "shortlisted"
+    else:
+        with pytest.raises(decisions.DecisionStoreError, match="backup"):
+            record(decisions, state_file)
+        assert state_file.read_bytes() == original
     assert backup_file.read_bytes() == original
-    assert stat.S_IMODE(backup_file.stat().st_mode) == 0o644
+    if os.name != "nt":
+        assert stat.S_IMODE(backup_file.stat().st_mode) == 0o644
 
 
 def test_v1_mutation_rejects_a_non_regular_existing_backup(tmp_path):
@@ -387,6 +410,145 @@ def test_mutation_reports_lock_contention_without_changing_source(tmp_path):
             decisions.forget_decision(state_file, SECOND_JOB_ID)
 
     assert state_file.read_bytes() == original
+
+
+def test_mutation_rejects_a_lock_symlink_to_the_source_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    if not create_symlink_if_supported(state_file, lock_file):
+        assert state_file.read_bytes() == original
+        assert not os.path.lexists(lock_file)
+        return
+
+    with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert lock_file.is_symlink()
+
+
+def test_mutation_rejects_a_lock_hard_link_to_the_source_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    if not create_hard_link_if_supported(state_file, lock_file):
+        assert state_file.read_bytes() == original
+        assert not lock_file.exists()
+        return
+
+    with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert os.path.samefile(state_file, lock_file)
+
+
+def test_mutation_rejects_a_lock_hard_link_to_another_file_without_writing_it(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    other_file = tmp_path / "other-file"
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    other_file.write_bytes(b"")
+    if not create_hard_link_if_supported(other_file, lock_file):
+        assert state_file.read_bytes() == original
+        assert other_file.read_bytes() == b""
+        return
+
+    with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert other_file.read_bytes() == b""
+    assert os.path.samefile(other_file, lock_file)
+
+
+def test_mutation_rejects_a_non_regular_lock_without_changes(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    original = b'{"version": 2, "jobs": {}}\n'
+    state_file.write_bytes(original)
+    lock_file.mkdir()
+
+    with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    assert lock_file.is_dir()
+
+
+def test_mutation_reuses_an_independent_regular_lock_without_rewriting_it(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    state_file.write_bytes(b'{"version": 2, "jobs": {}}\n')
+    lock_file.write_bytes(b"\0")
+
+    record(decisions, state_file)
+
+    assert lock_file.read_bytes() == b"\0"
+    assert len(decisions.get_decision(state_file, JOB_ID)["history"]) == 1
+
+
+def test_lock_replacement_between_open_and_validation_fails_without_changes(
+    tmp_path, monkeypatch
+):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    lock_file = Path(f"{state_file}.lock")
+    displaced_lock = tmp_path / "displaced-lock"
+    replacement_file = tmp_path / "replacement-lock"
+    original = b'{"version": 2, "jobs": {}}\n'
+    replacement = b"unrelated replacement"
+    state_file.write_bytes(original)
+    lock_file.write_bytes(b"\0")
+    if os.name == "nt":
+        replacement_file.write_bytes(replacement)
+        replacement_stat = replacement_file.stat()
+        real_lstat = Path.lstat
+        lock_lstat_calls = 0
+
+        def report_replacement_after_open(path, *args, **kwargs):
+            nonlocal lock_lstat_calls
+            if path == lock_file:
+                lock_lstat_calls += 1
+                if lock_lstat_calls == 2:
+                    return replacement_stat
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "lstat", report_replacement_after_open)
+    else:
+        real_open = decisions.os.open
+        replaced = False
+
+        def replace_lock_after_open(path, *args, **kwargs):
+            nonlocal replaced
+            fd = real_open(path, *args, **kwargs)
+            if Path(path) == lock_file and not replaced:
+                lock_file.rename(displaced_lock)
+                lock_file.write_bytes(replacement)
+                replaced = True
+            return fd
+
+        monkeypatch.setattr(decisions.os, "open", replace_lock_after_open)
+
+    with pytest.raises(decisions.DecisionStoreError, match="lock"):
+        record(decisions, state_file)
+
+    assert state_file.read_bytes() == original
+    if os.name == "nt":
+        assert lock_file.read_bytes() == b"\0"
+        assert replacement_file.read_bytes() == replacement
+    else:
+        assert lock_file.read_bytes() == replacement
+        assert displaced_lock.read_bytes() == b"\0"
 
 
 def test_lock_cleanup_attempts_close_when_unlock_and_close_fail(tmp_path, monkeypatch):
@@ -773,6 +935,22 @@ def test_load_decisions_rejects_malformed_v2_state_without_rewriting_it(tmp_path
 
     with pytest.raises(decisions.DecisionStoreError, match=message):
         decisions.load_decisions(state_file)
+
+    assert state_file.read_bytes() == original
+
+
+def test_v2_mutation_rejects_unknown_root_fields_without_rewriting_state(tmp_path):
+    decisions = decisions_module()
+    state_file = tmp_path / "job-decisions.json"
+    original = json.dumps({
+        "version": 2,
+        "jobs": {JOB_ID: v2_record()},
+        "futureRootField": {"mustNotBeErased": True},
+    }, indent=2).encode("utf-8")
+    state_file.write_bytes(original)
+
+    with pytest.raises(decisions.DecisionStoreError, match="root"):
+        record(decisions, state_file, status="applied")
 
     assert state_file.read_bytes() == original
 

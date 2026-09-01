@@ -39,6 +39,7 @@ from job_decisions import (
     normalize_job_id,
     record_decision,
     validate_event_input,
+    validate_job_snapshot,
 )
 
 API = "https://pegel.berlin/api/v1/jobs"
@@ -141,6 +142,18 @@ def fetch(params: dict[str, str]) -> dict:
     return payload
 
 
+def _validated_fetched_job(job: object, job_id: str) -> dict | None:
+    if job is None:
+        return None
+    if not isinstance(job, dict) or job.get("id") != job_id:
+        raise PegelApiError("Pegel returned an invalid job response")
+    try:
+        validate_job_snapshot(job)
+    except DecisionStoreError as error:
+        raise PegelApiError("Pegel returned an invalid job snapshot") from error
+    return job
+
+
 def fetch_job(job_id: str) -> dict | None:
     job_id = normalize_job_id(job_id)
     url = f"{API}/{urllib.parse.quote(job_id, safe='')}"
@@ -148,9 +161,7 @@ def fetch_job(job_id: str) -> dict | None:
     if payload is None:
         return None
     job = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(job, dict) or job.get("id") != job_id:
-        raise PegelApiError("Pegel returned an invalid job response")
-    return job
+    return _validated_fetched_job(job, job_id)
 
 
 def collect_jobs(
@@ -407,7 +418,7 @@ def main(
             print(f"Decision error: {error}", file=stderr)
             return 2
         try:
-            job = (fetch_detail or fetch_job)(job_id)
+            job = _validated_fetched_job((fetch_detail or fetch_job)(job_id), job_id)
         except PegelApiError as error:
             job = None
             print(f"Warning: {error}; saved without a job snapshot.", file=stderr)

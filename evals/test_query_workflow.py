@@ -273,6 +273,57 @@ def test_mark_command_keeps_the_local_decision_when_snapshot_read_fails(tmp_path
     assert "title" not in saved
 
 
+@pytest.mark.parametrize(
+    "malformed_snapshot",
+    [
+        {"title": ["Not text"]},
+        {"company": "Not an object"},
+        {"company": {"slug": "example", "name": ["Not text"]}},
+        {"pegelUrl": "https://evil.example/jobs/role"},
+    ],
+)
+def test_malformed_public_snapshot_saves_private_mark_without_snapshot_or_metadata_request(
+    tmp_path, monkeypatch, malformed_snapshot
+):
+    state_file = tmp_path / "job-decisions.json"
+    calls = []
+    stderr = StringIO()
+    private_payload = {
+        "jobId": IDS[0],
+        "status": "rejected",
+        "note": "Private follow up",
+        "rejectionReason": "Private reason",
+        "responseKind": "human",
+        "contactName": "Private contact",
+    }
+    malformed_job = api_job(IDS[0], "Saved role")
+    malformed_job.update(malformed_snapshot)
+
+    def fetch_json(url, **kwargs):
+        calls.append((url, kwargs))
+        return {"data": malformed_job}
+
+    monkeypatch.setattr(pegel_query, "_fetch_json", fetch_json)
+
+    exit_code = pegel_query.main(
+        ["--state-file", str(state_file), "--mark-json-stdin"],
+        stdin=StringIO(json.dumps(private_payload)),
+        now=lambda: "2026-09-01T08:30:00Z",
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    saved = json.loads(state_file.read_text())["jobs"][IDS[0]]
+    assert calls == [(f"{pegel_query.API}/{IDS[0]}", {"allow_not_found": True})]
+    assert "Private" not in repr(calls)
+    assert "saved without a job snapshot" in stderr.getvalue()
+    assert saved["history"][0]["note"] == "Private follow up"
+    assert saved["history"][0]["rejectionReason"] == "Private reason"
+    assert saved["history"][0]["contactName"] == "Private contact"
+    assert not {"title", "company", "pegelUrl"} & set(saved)
+
+
 @pytest.mark.parametrize("read_result", [b"\xff", OSError("response body read failed")])
 def test_mark_command_keeps_the_decision_when_the_http_body_cannot_be_read(
     tmp_path,

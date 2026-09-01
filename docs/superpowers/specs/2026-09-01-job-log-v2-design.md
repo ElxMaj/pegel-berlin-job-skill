@@ -107,6 +107,10 @@ Validation rejects missing required fields, explicit nulls, unknown fields, NUL,
 characters, invalid dates, invalid enums, and oversized text. Newlines and tabs are allowed in notes
 and reasons, then rendered with safe indentation in text output.
 
+The schema v2 root is closed to `version` and `jobs`. Unknown root fields fail validation so a
+read-modify-write transaction cannot silently erase data it does not understand. Schema v1 remains
+limited to its existing compatibility contract.
+
 ## Migration and durability
 
 Schema v1 remains readable. A v1 record becomes one v2 history event whose status comes from
@@ -130,6 +134,9 @@ removes a role only from the active log and does not erase an existing migration
 Writes use one cross-platform advisory lock file beside the store. Unix uses `fcntl`; Windows uses
 `msvcrt`. A second writer fails cleanly rather than silently losing an event. The lock file contains
 no personal data and remains available for reuse after release.
+Creation is exclusive. Reuse requires an independent regular file with one link, verified with
+`lstat`, a no-follow open where available, and `fstat`. Symlinks, hard links, non-regular entries,
+and replacement races fail before lock acquisition or any Windows lock-byte write.
 An unlock error followed by a successful descriptor close does not turn a committed mutation into
 failure. A descriptor-close failure after commit raises the distinct
 `DecisionStoreCommittedError` for library callers. The CLI returns success with a warning that the
@@ -158,6 +165,10 @@ and `contactName` are optional but cannot be null when present. Unknown fields a
 Legacy `--reason`, `--response-kind`, `--contact-name`, `--note`, and `--date` flags are valid only
 with `--mark`; `--reason` additionally requires `rejected`. Invalid combinations fail before any
 API request or local write.
+
+The optional public detail snapshot is validated at the fetch boundary. A malformed title, company
+shape or name, or Pegel URL becomes a `PegelApiError`; the explicit event is saved without a snapshot
+and the request still contains only the public UUID.
 
 `--json` becomes a supported contract for every local action:
 

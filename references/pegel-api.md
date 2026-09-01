@@ -48,7 +48,8 @@ The application-history file is local. The list endpoint never receives its cont
 `--list-decisions` and `--history` make no API request. `--mark-json-stdin`, and the legacy
 `--mark` compatibility action, may read the single public `GET /jobs/<uuid>` endpoint to save a
 display snapshot, but sends only the public job UUID. If the read fails, it saves the event without
-the snapshot.
+the snapshot. A malformed title, company shape or name, or Pegel URL is treated as a failed snapshot
+and cannot block the explicit local mark.
 
 The preferred private action reads one bounded JSON object from stdin, keeping status and metadata
 out of child argv. The legacy `--date`, `--note`, `--reason`, `--response-kind`, and

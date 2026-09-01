@@ -109,10 +109,11 @@ them.
 The default file is `~/.local/share/pegel/job-decisions.json`, or
 `$XDG_DATA_HOME/pegel/job-decisions.json` when that variable is set. `--list-decisions` and
 `--history` are offline. A mark may make only the normal public UUID detail read for the title and
-link; if it fails, the event is still saved without a snapshot. Status and metadata never leave the
-machine. `--forget` removes a role only from the active log. A sensitive `.v1.bak` migration backup
-is never automatically rewritten or deleted. Read [README.md](README.md) for the command and schema
-reference.
+link; if it fails, the event is still saved without a snapshot. Status and metadata are never sent
+to Pegel or included in a Pegel API request. This boundary does not prevent host transcript or
+output capture. `--forget` removes a role only from the active log. A sensitive `.v1.bak` migration
+backup is never automatically rewritten or deleted. Read [README.md](README.md) for the command and
+schema reference.
 
 ### 2. Fit
 
