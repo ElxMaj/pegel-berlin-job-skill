@@ -37,21 +37,28 @@ on it, and they are the one who has to defend it in the interview.
 If the candidate does not meet a requirement, the skill says so. A missing qualification is a fact
 to work with, not a gap to paper over.
 
-## It will never send the CV anywhere
+## It does not upload the CV to Pegel
 
-The CV is read **locally**. It is never uploaded, never sent to Pegel, never posted to any service.
-Under GDPR a CV is personal data; the cleanest way to honour that is to never receive it.
+The assistant reads a CV file selected on the candidate's machine. The skill's query script does
+not send its contents to Pegel. The assistant must not upload the CV through a tool or paste its
+contents into a web request.
+
+Local file access does not imply local model processing. The AI host may send read content to its
+model provider or retain transcripts and output under its own settings. The assistant should
+explain that boundary before reading sensitive content. See
+[Claude Code's data-flow documentation](https://code.claude.com/docs/en/data-usage).
 
 If the environment cannot read a local file, the skill says so and stops. It will never suggest a
 cloud upload as a workaround.
 
-## It will never upload application history
+## It does not upload application history to Pegel
 
 All eight statuses, `shortlisted`, `applied`, `interviewing`, `offered`, `accepted`, `rejected`,
 `withdrawn`, and `passed`, stay in the candidate's local decision file. So do event dates, notes,
 rejection reasons, response kinds, and contact names. Normal searches read that file after the
 public API responds, then remove logged job IDs on the candidate's machine. Pegel never receives
-the status or event metadata in a URL, request body, or header.
+the status or event metadata in a URL, request body, or header from the query script. History
+read by an AI assistant is subject to the same host-processing boundary as a CV.
 
 Listing statuses and reading one role's history are offline. Marking a role may make one ordinary
 read-only request for that public job UUID so the local file can keep its title and Pegel link. The
